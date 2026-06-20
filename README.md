@@ -71,11 +71,16 @@ from an `aes256.dec`, reverse its 32 bytes before entering it here.
 
 *Settings → Contacts* lists the in-use digital contacts (plus a few spare slots
 for adding new ones); each has a name, a TG/ID number and a call type
-(Group/Private/All). Contacts and RX-group lists also populate the per-channel
-dropdowns described above. (Editing RX-group membership is still on the way.)
+(Group/Private/All). *Settings → RX Groups* edits TG lists (name + member
+contact indices). Contacts and RX groups also populate the per-channel dropdowns
+described above.
 
 *Settings → DTMF Contacts* manages DTMF contacts (name + a code of 0-9, A-D,
 \* and #).
+
+The **DMR-ID database** (caller-ID lookup) appears read-only in *Settings →
+Radio* as an entry count. It's a bulk download best managed with the OpenGD77
+CPS; this driver shows its status but does not write it.
 
 ## General settings
 

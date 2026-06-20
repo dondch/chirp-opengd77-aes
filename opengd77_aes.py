@@ -142,6 +142,12 @@ BOOT_LINES_ADDR = 0x7540                                # line1[16] @0x7540, lin
 BOOT_LINES_LEN = 32
 BOOT_INTRO_ADDR = 0x7518                                # 0x01 = text, 0x00 = picture
 
+# DMR-ID database header (read-only status only). The DB itself is a large,
+# sorted, compressed, multi-area bulk table managed by the OpenGD77 CPS
+# downloader -- not edited here.  Header: "Id" magic, count at bytes 8..11.
+DMRID_HEADER_ADDR = FLASH_OFFSET + 0x30000             # 0x50000
+DMRID_HEADER_LEN = 12
+
 CSS_NONE = 0xFFFF
 
 # --------------------------------------------------------------------------
@@ -161,7 +167,8 @@ IMG_RXGROUP = IMG_CONTACTS + CONTACTS_REGION_LEN
 IMG_DTMF = IMG_RXGROUP + RXGROUP_REGION_LEN
 IMG_BOOT = IMG_DTMF + DTMF_REGION_LEN
 IMG_BOOTTYPE = IMG_BOOT + BOOT_LINES_LEN
-IMAGE_SIZE = IMG_BOOTTYPE + 1
+IMG_DMRIDHDR = IMG_BOOTTYPE + 1
+IMAGE_SIZE = IMG_DMRIDHDR + DMRID_HEADER_LEN
 
 _RANGES = [
     # (image_offset, area, device_addr, length)
@@ -176,6 +183,7 @@ _RANGES = [
     (IMG_DTMF, AREA_EEPROM, DTMF_ADDR, DTMF_REGION_LEN),
     (IMG_BOOT, AREA_EEPROM, BOOT_LINES_ADDR, BOOT_LINES_LEN),
     (IMG_BOOTTYPE, AREA_EEPROM, BOOT_INTRO_ADDR, 1),
+    (IMG_DMRIDHDR, AREA_FLASH, DMRID_HEADER_ADDR, DMRID_HEADER_LEN),
 ]
 
 # Writable spans: (image_offset, raw_flash_addr, length).  All written through
@@ -188,6 +196,7 @@ _WRITE_SPANS = [
     (IMG_GENSET, GENSET_ADDR, GENSET_LEN),
     (IMG_ZONE, ZONE_BITMAP_ADDR, ZONE_REGION_LEN),
     (IMG_CONTACTS, CONTACT_ADDR, CONTACTS_REGION_LEN),
+    (IMG_RXGROUP, RXGROUP_LEN_ADDR, RXGROUP_REGION_LEN),
     (IMG_DTMF, DTMF_ADDR, DTMF_REGION_LEN),
     (IMG_BOOT, BOOT_LINES_ADDR, BOOT_LINES_LEN),
     (IMG_BOOTTYPE, BOOT_INTRO_ADDR, 1),
@@ -501,9 +510,9 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             "This driver targets the OpenGD77-AES256 firmware.  Supported: "
             "AES-256 key management (Settings -> AES Keys), channel read/write "
             "(memories 1-1024, analog + DMR), zones (as banks), digital + DTMF "
-            "contacts, and radio settings (callsign, DMR ID, boot screen).  "
-            "RX-group membership editing and the DMR-ID database are still in "
-            "development.\n\n"
+            "contacts, RX groups, and radio settings (callsign, DMR ID, boot "
+            "screen).  The DMR-ID database shows a read-only status; bulk "
+            "import is left to the OpenGD77 CPS.\n\n"
             "AES voice encryption is only legal on licensed commercial / PMR "
             "allocations -- NOT on amateur (ham) bands.")
         rp.pre_download = (
@@ -960,6 +969,18 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         o = self._rxgroup_off(i)
         return _decode_name(img[o:o + 16])
 
+    def _rxgroup_members(self, img, i):
+        if not self._rxgroup_inuse(img, i):
+            return []
+        o = self._rxgroup_off(i) + 16
+        out = []
+        for k in range(32):
+            c = struct.unpack_from("<H", img, o + k * 2)[0]
+            if c == 0:
+                break
+            out.append(c)
+        return out
+
     def _dtmf_off(self, i):
         return IMG_DTMF + (i - 1) * DTMF_SIZE
 
@@ -1026,7 +1047,39 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             "boot_screen", "Boot screen",
             RadioSettingValueList(["Picture", "Text"],
                                   "Text" if img[IMG_BOOTTYPE] == 1 else "Picture")))
+
+        hdr = img[IMG_DMRIDHDR:IMG_DMRIDHDR + DMRID_HEADER_LEN]
+        if hdr[0:2] == b"Id":
+            db = "%d entries" % int.from_bytes(hdr[8:12], "little")
+        else:
+            db = "not loaded (use the OpenGD77 CPS downloader)"
+        dbset = RadioSetting("dmrid_db", "DMR-ID database (read-only)",
+                             RadioSettingValueString(0, 50, db, autopad=False))
+        dbset.set_doc("Informational. The DMR-ID database is a bulk download "
+                      "managed by the OpenGD77 CPS; this field is not written.")
+        radio.append(dbset)
         return radio
+
+    def _get_rxgroup_settings(self):
+        img = self._mmap.get_packed()
+        group = RadioSettingGroup("rxgroups", "RX Groups")
+        inuse = [i for i in range(1, RXGROUPS_MAX + 1)
+                 if self._rxgroup_inuse(img, i)]
+        spares = [i for i in range(1, RXGROUPS_MAX + 1)
+                  if not self._rxgroup_inuse(img, i)][:4]
+        for i in sorted(set(inuse) | set(spares)):
+            name = self._rxgroup_name(img, i) if self._rxgroup_inuse(img, i) else ""
+            members = ",".join(str(c) for c in self._rxgroup_members(img, i))
+            sub = RadioSettingGroup("rxgroup_%d" % i, "RX Group %d" % i)
+            sub.append(RadioSetting(
+                "rxgroup_%d_name" % i, "Name",
+                RadioSettingValueString(0, 16, name, autopad=False)))
+            sub.append(RadioSetting(
+                "rxgroup_%d_members" % i, "Contact indices (comma-separated)",
+                RadioSettingValueString(0, 200, members, autopad=False,
+                                        charset="0123456789, ")))
+            group.append(sub)
+        return group
 
     def _get_dtmf_settings(self):
         img = self._mmap.get_packed()
@@ -1072,6 +1125,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
     def get_settings(self):
         radio = self._get_radio_settings()
         contacts = self._get_contacts_settings()
+        rxgroups = self._get_rxgroup_settings()
         dtmf = self._get_dtmf_settings()
         store = self._read_aes_store()
         aes = RadioSettingGroup("aes", "AES Keys")
@@ -1099,7 +1153,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 "aes_key_%d" % i, "Key id %d (64 hex)" % i,
                 RadioSettingValueString(0, 64, slot.key_hex,
                                         autopad=False, charset=HEX)))
-        return RadioSettings(radio, contacts, dtmf, aes)
+        return RadioSettings(radio, contacts, rxgroups, dtmf, aes)
 
     def set_settings(self, settings):
         flat = {}
@@ -1169,6 +1223,29 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                     img[o + 23] = 0xFF       # reserve1 (no TS override)
             else:
                 img[o:o + CONTACT_SIZE] = b"\xFF" * CONTACT_SIZE
+
+        # -- RX groups --
+        for i in range(1, RXGROUPS_MAX + 1):
+            nk = "rxgroup_%d_name" % i
+            if nk not in flat:
+                continue
+            lenoff = IMG_RXGROUP + (i - 1)
+            o = self._rxgroup_off(i)
+            name = str(flat[nk].value).strip()
+            mstr = str(flat["rxgroup_%d_members" % i].value).replace(" ", "")
+            members = [int(x) for x in mstr.split(",")
+                       if x.isdigit() and 0 < int(x) <= CONTACTS_MAX][:32]
+            if name and members:
+                img[lenoff] = len(members)
+                img[o:o + 16] = _encode_name(name, 16)
+                for k in range(32):
+                    struct.pack_into("<H", img, o + 16 + k * 2,
+                                     members[k] if k < len(members) else 0)
+            elif 0 < img[lenoff] <= 32:          # was in use -> delete
+                img[lenoff] = 0
+                img[o:o + 16] = b"\xFF" * 16
+                for k in range(32):
+                    struct.pack_into("<H", img, o + 16 + k * 2, 0)
 
         # -- AES key store --
         store = AesKeyStore.from_payload(

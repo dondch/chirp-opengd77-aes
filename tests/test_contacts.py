@@ -93,6 +93,54 @@ def test_rxgroup_read():
     assert (3, "WIDE") in radio._rxgroups
 
 
+def test_rxgroup_edit_via_settings():
+    fake = FakeOpenGD77()
+    radio = drv.OpenGD77AESRadio(fake)
+    radio.sync_in()
+    settings = radio.get_settings()
+    flat = _flatten(settings)
+    i = min(int(k.split("_")[1]) for k in flat
+            if k.startswith("rxgroup_") and k.endswith("_name"))
+    flat["rxgroup_%d_name" % i].value = "MYGRP"
+    flat["rxgroup_%d_members" % i].value = "5,6,7"
+    radio.set_settings(settings)
+    radio.sync_out()
+
+    r2 = drv.OpenGD77AESRadio(fake)
+    r2.sync_in()
+    img = r2._mmap.get_packed()
+    assert r2._rxgroup_inuse(img, i)
+    assert r2._rxgroup_name(img, i) == "MYGRP"
+    assert r2._rxgroup_members(img, i) == [5, 6, 7]
+
+
+def _put_dmrid_header(fake, count):
+    o = drv.DMRID_HEADER_ADDR
+    h = bytearray(b"\xFF" * drv.DMRID_HEADER_LEN)
+    h[0:2] = b"Id"
+    h[2] = ord("I")
+    h[3] = 0x4A + 8
+    h[8:12] = count.to_bytes(4, "little")
+    fake.flash[o:o + drv.DMRID_HEADER_LEN] = h
+
+
+def test_dmrid_db_status():
+    fake = FakeOpenGD77()
+    _put_dmrid_header(fake, 12345)
+    radio = drv.OpenGD77AESRadio(fake)
+    radio.sync_in()
+    flat = _flatten(radio.get_settings())
+    assert "12345 entries" == str(flat["dmrid_db"].value)
+
+
+def test_dmrid_db_status_empty():
+    fake = FakeOpenGD77()
+    radio = drv.OpenGD77AESRadio(fake)
+    radio.sync_in()
+    flat = _flatten(radio.get_settings())
+    assert "not loaded" in str(flat["dmrid_db"].value)
+
+
 def test_channel_contact_and_tg_dropdown_roundtrip():
     fake = FakeOpenGD77()
     _zero_ch_bitmaps(fake)

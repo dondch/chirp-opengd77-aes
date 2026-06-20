@@ -29,18 +29,20 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
 * **Digital contacts** (read/write) — Settings → Contacts lists in-use contacts
   plus spare slots; each has name, TG/ID number (big-endian BCD) and call type
   (Group/Private/All). A channel's **Contact** field is now a name **dropdown**.
-* **RX-group lists** (read) — a channel's **RX group list** field is a name
-  dropdown. (RX-group membership editing to follow.)
+* **RX-group lists** (read/write) — Settings → RX Groups (name + member contact
+  indices); a channel's **RX group list** field is a name dropdown.
 * **DTMF contacts** (read/write) — Settings → DTMF Contacts (name + code,
   digits 0-9 A-D * #).
 * **Boot screen** (read/write) — boot text line 1 / line 2 and the boot screen
   type (Picture/Text), in Settings → Radio.
+* **DMR-ID database** — read-only status (entry count) in Settings → Radio. The
+  database is a bulk download managed by the OpenGD77 CPS; not written here.
 * **Host tests, no hardware** — fake-radio fixture + AES codec round-trip,
   sibling-block preservation, BCD helpers, channel encode/decode round-trips,
   diff-only sector writes, unmanaged-byte preservation, general-settings
   round-trip, zone create/membership/rename/multi-zone, contact read/create,
-  RX-group read, channel contact/TG dropdowns, DTMF read/create, boot text.
-  `python run_tests.py` → 29 passed.
+  RX-group read/edit, channel contact/TG dropdowns, DTMF read/create, boot text,
+  DMR-ID DB status. `python run_tests.py` → 32 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -84,6 +86,11 @@ correct; channel 1's Contact dropdown correctly resolved to `6: DCH_Group`.
 screen type `Text`; 0 DTMF contacts on the radio (none programmed). DTMF/boot
 write use the same proven flash path + host tests. ✔
 
+**RX-group edit + DMR-ID status (2026-06-21, COM4):** read the radio's RX groups
+(`Brandmeister` → [1,4,5,3], `DMR MARC` → [1]); created `ZZRXGRP` → [6] in a
+free slot, read back, restored the RX-group sectors byte-exact. DMR-ID DB status
+read as "not loaded" (the radio has no DB downloaded). ✔
+
 ## Write mechanism — solved
 
 The earlier channel-write blocker is resolved. On MD-UV380/390 the "EEPROM"
@@ -96,12 +103,13 @@ is no write-path blocker.
 
 ## Deferred (next phases)
 
-1. **RX-group membership editing** (read + channel dropdown done; editing the
-   group's contact list pending).
-2. **General settings** — callsign, DMR ID and boot screen done; misc toggles
+1. **General settings** — callsign, DMR ID, boot screen done; misc toggles
    (monitor/VOX/timers, the flag bytes at `0x00FA`-`0x00FD`) pending.
-3. **DMR-ID database** (raw flash `0x30000`) — large callsign-lookup table.
-4. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
+2. **DMR-ID database bulk import** (status read-only today). A CSV/`radioid.net`
+   importer that builds the sorted, 6-bit-compressed, two-area DB and writes
+   ~256 KB would replicate the CPS downloader — large; currently out of scope
+   (use the OpenGD77 CPS for this).
+3. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
    only a *from-source frozen rebuild* would also need the module added to
    `chirp/drivers/__init__.py:__all__` (not required for Load Module).
 
