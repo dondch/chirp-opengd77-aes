@@ -57,8 +57,10 @@ fields CHIRP doesn't expose.
 ## Zones
 
 Zones appear as **banks** in CHIRP's bank view. A channel can belong to several
-zones; you can add/remove channels, rename a zone, and create new zones (up to
-68). The driver auto-detects the radio's 80- or 16-channels-per-zone format.
+zones; you can add/remove channels, rename a zone, and create new zones. The
+Banks tab shows your in-use zones plus a few spare slots for new ones (reload
+the tab for more spares once those are used). The driver auto-detects the
+radio's 80- or 16-channels-per-zone format.
 
 ### Key byte order (important)
 

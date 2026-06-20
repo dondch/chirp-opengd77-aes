@@ -610,7 +610,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 raise errors.RadioError(
                     "Connected radio is not an MD-UV380/390 (radioType=%d)" %
                     info["radio_type"])
-            img = self._mmap.get_packed()
+            img = self._img()
             orig = getattr(self, "_orig", None)
             status = chirp_common.Status()
             status.msg = "Writing codeplug"
@@ -631,19 +631,31 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         # and RX-group name caches used for channel dropdowns.
         self._build_caches()
 
+    def _img(self):
+        # Cache the packed image. get_packed() rebuilds a bytes from a list on
+        # every call, which is very expensive in hot loops (e.g. the bank
+        # editor). The cache is invalidated automatically when _mmap is
+        # replaced -- every edit creates a new MemoryMapBytes object.
+        if getattr(self, "_packed_for", None) is not self._mmap:
+            self._packed = self._mmap.get_packed()
+            self._packed_for = self._mmap
+        return self._packed
+
     # -- AES key store access on the image ------------------------------
     def _aes_region(self):
-        return self._mmap.get_packed()[IMG_AES:IMG_AES + SECTOR_SIZE]
+        return self._img()[IMG_AES:IMG_AES + SECTOR_SIZE]
 
     def _read_aes_store(self):
         _, payload = find_aes_block(self._aes_region())
         return AesKeyStore.from_payload(payload)
 
     def _write_aes_store(self, store):
-        region = region_with_aes(self._aes_region(), store.to_payload())
-        self._mmap[IMG_AES] = region
+        img = bytearray(self._img())
+        img[IMG_AES:IMG_AES + SECTOR_SIZE] = region_with_aes(
+            bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE]), store.to_payload())
+        self._mmap = memmap.MemoryMapBytes(bytes(img))
 
-    # -- channels (READ-ONLY in this build) -----------------------------
+    # -- channels -------------------------------------------------------
     def _channel_offset(self, number):
         """Return (image_offset, bitmap_image_offset, bit_index) for channel
         @number (1-based)."""
@@ -659,13 +671,13 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return base + 16 + within * CH_SIZE, base + within // 8, within % 8
 
     def _channel_in_use(self, number):
-        data = self._mmap.get_packed()
+        data = self._img()
         _, bm, bit = self._channel_offset(number)
         return bool((data[bm] >> bit) & 0x01)
 
     def get_raw_memory(self, number):
         off, _, _ = self._channel_offset(number)
-        return util.hexprint(self._mmap.get_packed()[off:off + CH_SIZE])
+        return util.hexprint(self._img()[off:off + CH_SIZE])
 
     def get_memory(self, number):
         mem = chirp_common.Memory()
@@ -675,7 +687,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             return mem
 
         off, _, _ = self._channel_offset(number)
-        raw = self._mmap.get_packed()[off:off + CH_SIZE]
+        raw = self._img()[off:off + CH_SIZE]
         mem.name = _decode_name(raw[0:16])
 
         rx = _bcd2int(struct.unpack_from("<I", raw, 16)[0]) * 10
@@ -775,7 +787,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         mem.extra = group
 
     def set_memory(self, mem):
-        img = bytearray(self._mmap.get_packed())
+        img = bytearray(self._img())
         off, bm, bit = self._channel_offset(mem.number)
 
         if mem.empty:
@@ -872,7 +884,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return OpenGD77BankModel(self, "Zones")
 
     def _channels_per_zone(self):
-        b = self._mmap.get_packed()[IMG_ZONE + ZONE_DETECT_OFF]
+        b = self._img()[IMG_ZONE + ZONE_DETECT_OFF]
         return 80 if b <= 0x04 else 16
 
     def _zone_stride(self):
@@ -892,7 +904,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return self._zone_name(img, i) or ("Zone %d" % (i + 1))
 
     def _zone_channel_list(self, i):
-        img = self._mmap.get_packed()
+        img = self._img()
         if not self._zone_inuse(img, i):
             return []
         cpz = self._channels_per_zone()
@@ -906,7 +918,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return out
 
     def _zone_write(self, i, name, channels):
-        img = bytearray(self._mmap.get_packed())
+        img = bytearray(self._img())
         cpz = self._channels_per_zone()
         o = self._zone_slot(i)
         img[o:o + ZONE_NAME_LEN] = _encode_name(name, ZONE_NAME_LEN)
@@ -920,16 +932,17 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         else:
             img[bmbyte] = img[bmbyte] & ~(1 << (i % 8)) & 0xFF
         self._mmap = memmap.MemoryMapBytes(bytes(img))
+        self._build_caches()      # zone membership changed
 
     def _zone_add(self, i, ch):
         chans = self._zone_channel_list(i)
         if ch not in chans:
             chans.append(ch)
-        self._zone_write(i, self._zone_label(self._mmap.get_packed(), i), chans)
+        self._zone_write(i, self._zone_label(self._img(), i), chans)
 
     def _zone_remove(self, i, ch):
         chans = [c for c in self._zone_channel_list(i) if c != ch]
-        name = self._zone_name(self._mmap.get_packed(), i)
+        name = self._zone_name(self._img(), i)
         if not chans and not name:
             self._zone_write(i, "", [])
         else:
@@ -1000,13 +1013,20 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return name, "".join(code)
 
     def _build_caches(self):
-        img = self._mmap.get_packed()
+        img = self._img()
         self._contacts = [(i, self._contact_name(img, i))
                           for i in range(1, CONTACTS_MAX + 1)
                           if self._contact_inuse(img, i)]
         self._rxgroups = [(i, self._rxgroup_name(img, i))
                           for i in range(1, RXGROUPS_MAX + 1)
                           if self._rxgroup_inuse(img, i)]
+        # Reverse map channel-number -> [zone slot indices] so that the bank
+        # editor's get_memory_mappings() is O(1) instead of O(zones) per memory.
+        self._zone_member_map = {}
+        for i in range(ZONES_MAX):
+            if self._zone_inuse(img, i):
+                for ch in self._zone_channel_list(i):
+                    self._zone_member_map.setdefault(ch, []).append(i)
 
     @staticmethod
     def _parse_index(value):
@@ -1020,7 +1040,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
 
     # -- settings: general + AES key store ------------------------------
     def _get_radio_settings(self):
-        gs = self._mmap.get_packed()[IMG_GENSET:IMG_GENSET + GENSET_LEN]
+        gs = self._img()[IMG_GENSET:IMG_GENSET + GENSET_LEN]
         radio = RadioSettingGroup("radio", "Radio")
         radio.append(RadioSetting(
             "callsign", "Callsign (radio name)",
@@ -1033,7 +1053,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             "dmrid", "DMR ID",
             RadioSettingValueInteger(0, 16777215, dmrid)))
 
-        img = self._mmap.get_packed()
+        img = self._img()
         radio.append(RadioSetting(
             "boot_line1", "Boot text line 1",
             RadioSettingValueString(0, 16, _decode_name(img[IMG_BOOT:IMG_BOOT + 16]),
@@ -1061,7 +1081,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return radio
 
     def _get_rxgroup_settings(self):
-        img = self._mmap.get_packed()
+        img = self._img()
         group = RadioSettingGroup("rxgroups", "RX Groups")
         inuse = [i for i in range(1, RXGROUPS_MAX + 1)
                  if self._rxgroup_inuse(img, i)]
@@ -1082,7 +1102,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return group
 
     def _get_dtmf_settings(self):
-        img = self._mmap.get_packed()
+        img = self._img()
         group = RadioSettingGroup("dtmf", "DTMF Contacts")
         inuse = [i for i in range(1, DTMF_MAX + 1) if self._dtmf_inuse(img, i)]
         spares = [i for i in range(1, DTMF_MAX + 1)
@@ -1101,7 +1121,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return group
 
     def _get_contacts_settings(self):
-        img = self._mmap.get_packed()
+        img = self._img()
         group = RadioSettingGroup("contacts", "Contacts")
         inuse = [i for i in range(1, CONTACTS_MAX + 1)
                  if self._contact_inuse(img, i)]
@@ -1166,7 +1186,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                     walk(el)
         walk(settings)
 
-        img = bytearray(self._mmap.get_packed())
+        img = bytearray(self._img())
 
         # -- general (radio) settings --
         if "callsign" in flat:
@@ -1292,13 +1312,27 @@ class OpenGD77Bank(chirp_common.NamedBank):
 
 
 class OpenGD77BankModel(chirp_common.MTOBankModel):
+    # Showing all 68 zone slots makes the bank grid huge and slow to build; show
+    # the in-use zones plus a few empty slots for creating new zones (reload the
+    # tab for more spares once these are used).
+    SPARE_ZONES = 8
+
+    def _shown_indices(self):
+        radio = self._radio
+        img = radio._img()
+        inuse = [i for i in range(ZONES_MAX) if radio._zone_inuse(img, i)]
+        spares = [i for i in range(ZONES_MAX)
+                  if not radio._zone_inuse(img, i)][:self.SPARE_ZONES]
+        return sorted(set(inuse) | set(spares))
+
     def get_num_mappings(self):
         return ZONES_MAX
 
     def get_mappings(self):
-        img = self._radio._mmap.get_packed()
-        return [OpenGD77Bank(self, i, self._radio._zone_label(img, i))
-                for i in range(ZONES_MAX)]
+        radio = self._radio
+        img = radio._img()
+        return [OpenGD77Bank(self, i, radio._zone_label(img, i))
+                for i in self._shown_indices()]
 
     def add_memory_to_mapping(self, memory, mapping):
         self._radio._zone_add(mapping.get_index(), memory.number)
@@ -1311,9 +1345,7 @@ class OpenGD77BankModel(chirp_common.MTOBankModel):
                 for n in self._radio._zone_channel_list(mapping.get_index())]
 
     def get_memory_mappings(self, memory):
-        img = self._radio._mmap.get_packed()
-        out = []
-        for i in range(ZONES_MAX):
-            if memory.number in self._radio._zone_channel_list(i):
-                out.append(OpenGD77Bank(self, i, self._radio._zone_label(img, i)))
-        return out
+        radio = self._radio
+        img = radio._img()
+        zones = getattr(radio, "_zone_member_map", {}).get(memory.number, [])
+        return [OpenGD77Bank(self, i, radio._zone_label(img, i)) for i in zones]

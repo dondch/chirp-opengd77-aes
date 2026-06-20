@@ -42,7 +42,8 @@ def test_zone_create_members_name():
 
     model = radio.get_bank_model()
     banks = model.get_mappings()
-    assert len(banks) == drv.ZONES_MAX
+    # Only in-use zones + a few spares are shown (not all 68 slots).
+    assert 1 <= len(banks) <= drv.ZONES_MAX
     model.add_memory_to_mapping(radio.get_memory(2), banks[0])
     model.add_memory_to_mapping(radio.get_memory(3), banks[0])
     banks[0].set_name("My Zone")
@@ -93,3 +94,21 @@ def test_zone_remove_member():
 def test_zone_format_detected_80():
     fake, radio = _fresh()
     assert radio._channels_per_zone() == 80
+
+
+def test_zone_bank_count_is_limited():
+    # A fresh radio with no zones must show only spare slots (not all 68),
+    # otherwise the Banks tab is huge and slow.
+    fake, radio = _fresh()
+    banks = radio.get_bank_model().get_mappings()
+    assert len(banks) <= 12
+
+
+def test_zone_membership_cache_updates_on_edit():
+    fake, radio = _fresh()
+    _mk_channel(radio, 4, "CH4")
+    model = radio.get_bank_model()
+    model.add_memory_to_mapping(radio.get_memory(4), model.get_mappings()[0])
+    # get_memory_mappings uses the cache, which must be fresh after the edit.
+    maps = model.get_memory_mappings(radio.get_memory(4))
+    assert len(maps) == 1

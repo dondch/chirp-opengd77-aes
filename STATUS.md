@@ -23,9 +23,10 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   DMR ID is big-endian BCD; callsign is an 8-char padded string. (More
   general-settings fields — boot text, toggles — to follow.)
 * **Zones → CHIRP banks** (read/write). A channel can belong to several zones
-  (MTOBankModel). Add/remove channels, rename, create new zones (up to 68).
-  Auto-detects the 80- vs 16-channel-per-zone format. Channels keep their order
-  within a zone.
+  (MTOBankModel). Add/remove channels, rename, create new zones (up to 68). The
+  Banks tab shows in-use zones plus a few spare slots (not all 68) and uses a
+  cached image + channel→zone reverse map, so it loads instantly. Auto-detects
+  the 80- vs 16-channel-per-zone format; channel order within a zone is kept.
 * **Digital contacts** (read/write) — Settings → Contacts lists in-use contacts
   plus spare slots; each has name, TG/ID number (big-endian BCD) and call type
   (Group/Private/All). A channel's **Contact** field is now a name **dropdown**.
@@ -42,7 +43,8 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   diff-only sector writes, unmanaged-byte preservation, general-settings
   round-trip, zone create/membership/rename/multi-zone, contact read/create,
   RX-group read/edit, channel contact/TG dropdowns, DTMF read/create, boot text,
-  DMR-ID DB status. `python run_tests.py` → 32 passed.
+  DMR-ID DB status, bank-count limit + membership cache. `python run_tests.py`
+  → 34 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
