@@ -159,6 +159,32 @@ def test_bad_radio_type_rejected():
         assert False, "expected a RadioError for wrong radio type"
 
 
+def _flatten(settings):
+    flat = {}
+    for group in settings:
+        for el in group:
+            flat[el.get_name()] = el
+    return flat
+
+
+def test_general_settings_roundtrip():
+    fake = FakeOpenGD77()
+    radio = drv.OpenGD77AESRadio(fake)
+    radio.sync_in()
+    settings = radio.get_settings()
+    flat = _flatten(settings)
+    flat["callsign"].value = "N0CALL"
+    flat["dmrid"].value = 1234567
+    radio.set_settings(settings)
+    radio.sync_out()
+
+    r2 = drv.OpenGD77AESRadio(fake)
+    r2.sync_in()
+    f2 = _flatten(r2.get_settings())
+    assert str(f2["callsign"].value) == "N0CALL"
+    assert int(f2["dmrid"].value) == 1234567
+
+
 def test_invalid_hex_key_rejected():
     fake = FakeOpenGD77()
     _preload_aes(fake, drv.AesKeyStore())

@@ -60,6 +60,11 @@ Keys are entered and displayed in the **radio / CPS byte order**, which is the
 characters exactly as the radio/CPS shows them (MSB first). If you have a key
 from an `aes256.dec`, reverse its 32 bytes before entering it here.
 
+## General settings
+
+*Settings → Radio* exposes the radio **callsign** and **DMR ID** (read/write).
+More general-settings fields and the other codeplug objects are on the way.
+
 ## How it works
 
 The driver speaks the OpenGD77 CPS USB protocol (single-byte `R`/`X`/`C`

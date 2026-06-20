@@ -92,6 +92,10 @@ EE_CH_DATA_ADDR = 0x3790
 FLASH_CH_BITMAP_ADDR = FLASH_OFFSET + 0x7B1B0        # 0x9B1B0 (bank 1 bitmap)
 FLASH_BANK_STRIDE = 16 + CH_PER_BANK * CH_SIZE       # 7184
 
+# General settings (EEPROM region == raw flash offset 0)
+GENSET_ADDR = 0x00E0            # callsign[8] @0xE0, radioId(BCD BE)[4] @0xE8
+GENSET_LEN = 40
+
 CSS_NONE = 0xFFFF
 
 # --------------------------------------------------------------------------
@@ -104,7 +108,8 @@ IMG_EE_BITMAP = IMG_AES + SECTOR_SIZE                # 0x1000
 IMG_EE_CH = IMG_EE_BITMAP + 16                       # 0x1010
 IMG_FLASH_CH = IMG_EE_CH + CH_PER_BANK * CH_SIZE     # 0x2C10
 FLASH_CH_LEN = (CH_BANKS - 1) * FLASH_BANK_STRIDE    # 7 banks = 50288
-IMAGE_SIZE = IMG_FLASH_CH + FLASH_CH_LEN             # 61568
+IMG_GENSET = IMG_FLASH_CH + FLASH_CH_LEN             # 0xF080
+IMAGE_SIZE = IMG_GENSET + GENSET_LEN
 
 _RANGES = [
     # (image_offset, area, device_addr, length)
@@ -112,6 +117,7 @@ _RANGES = [
     (IMG_EE_BITMAP, AREA_EEPROM, EE_CH_BITMAP_ADDR, 16),
     (IMG_EE_CH, AREA_EEPROM, EE_CH_DATA_ADDR, CH_PER_BANK * CH_SIZE),
     (IMG_FLASH_CH, AREA_FLASH, FLASH_CH_BITMAP_ADDR, FLASH_CH_LEN),
+    (IMG_GENSET, AREA_EEPROM, GENSET_ADDR, GENSET_LEN),
 ]
 
 # Writable spans: (image_offset, raw_flash_addr, length).  All written through
@@ -121,6 +127,7 @@ _WRITE_SPANS = [
     (IMG_AES, CUSTOM_DATA_ADDR, SECTOR_SIZE),
     (IMG_EE_BITMAP, EE_CH_BITMAP_ADDR, 16 + CH_PER_BANK * CH_SIZE),
     (IMG_FLASH_CH, FLASH_CH_BITMAP_ADDR, FLASH_CH_LEN),
+    (IMG_GENSET, GENSET_ADDR, GENSET_LEN),
 ]
 
 HEX = "0123456789abcdefABCDEF"
@@ -775,8 +782,24 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             rx = css_dtcs(mem.dtcs, pol[1])
         return tx, rx
 
-    # -- settings: AES key store ----------------------------------------
+    # -- settings: general + AES key store ------------------------------
+    def _get_radio_settings(self):
+        gs = self._mmap.get_packed()[IMG_GENSET:IMG_GENSET + GENSET_LEN]
+        radio = RadioSettingGroup("radio", "Radio")
+        radio.append(RadioSetting(
+            "callsign", "Callsign (radio name)",
+            RadioSettingValueString(0, 8, _decode_name(gs[0:8]),
+                                    autopad=False)))
+        dmrid = _bcd2int(int.from_bytes(gs[8:12], "big"))
+        if not (0 <= dmrid <= 16777215):        # unset / 0xFF -> show 0
+            dmrid = 0
+        radio.append(RadioSetting(
+            "dmrid", "DMR ID",
+            RadioSettingValueInteger(0, 16777215, dmrid)))
+        return radio
+
     def get_settings(self):
+        radio = self._get_radio_settings()
         store = self._read_aes_store()
         aes = RadioSettingGroup("aes", "AES Keys")
 
@@ -803,10 +826,9 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 "aes_key_%d" % i, "Key id %d (64 hex)" % i,
                 RadioSettingValueString(0, 64, slot.key_hex,
                                         autopad=False, charset=HEX)))
-        return RadioSettings(aes)
+        return RadioSettings(radio, aes)
 
     def set_settings(self, settings):
-        store = self._read_aes_store()
         flat = {}
 
         def walk(group):
@@ -817,9 +839,21 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                     walk(el)
         walk(settings)
 
+        img = bytearray(self._mmap.get_packed())
+
+        # -- general (radio) settings --
+        if "callsign" in flat:
+            img[IMG_GENSET:IMG_GENSET + 8] = _encode_name(
+                str(flat["callsign"].value), 8)
+        if "dmrid" in flat:
+            img[IMG_GENSET + 8:IMG_GENSET + 12] = \
+                _int2bcd(int(flat["dmrid"].value)).to_bytes(4, "big")
+
+        # -- AES key store --
+        store = AesKeyStore.from_payload(
+            find_aes_block(bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE]))[1])
         if "aes_txkeyid" in flat:
             store.tx_key_id = int(flat["aes_txkeyid"].value)
-
         for i in range(AESK_NUM_SLOTS):
             vkey = "aes_valid_%d" % i
             kkey = "aes_key_%d" % i
@@ -842,5 +876,8 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 store.slots[i] = AesSlot(True, i, key)
             else:
                 store.slots[i] = AesSlot(False, i, b"")
+        region = region_with_aes(
+            bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE]), store.to_payload())
+        img[IMG_AES:IMG_AES + SECTOR_SIZE] = region
 
-        self._write_aes_store(store)
+        self._mmap = memmap.MemoryMapBytes(bytes(img))

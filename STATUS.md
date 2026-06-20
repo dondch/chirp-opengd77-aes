@@ -19,10 +19,13 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   per-channel fields CHIRP doesn't expose. Covers both the EEPROM bank
   (channels 1–128) and the flash banks (129–1024) — the EEPROM region is just
   SPI flash at offset 0, written via the flash protocol.
+* **General settings — callsign + DMR ID** (Settings → Radio), read/write.
+  DMR ID is big-endian BCD; callsign is an 8-char padded string. (More
+  general-settings fields — boot text, toggles — to follow.)
 * **Host tests, no hardware** — fake-radio fixture + AES codec round-trip,
   sibling-block preservation, BCD helpers, channel encode/decode round-trips,
-  diff-only sector writes, unmanaged-byte preservation, end-to-end
-  download/edit/upload. `python run_tests.py` → 17 passed.
+  diff-only sector writes, unmanaged-byte preservation, general-settings
+  round-trip, end-to-end download/edit/upload. `python run_tests.py` → 18 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -67,7 +70,8 @@ is no write-path blocker.
 2. **RX group lists** (80 B, 76 max) — flash `0xAD620`.
 3. **Digital contacts** (24 B, 1024 max) — flash `0xA7620`.
 4. **DTMF contacts** (32 B, 63 max) — raw `0x2F88`.
-5. **General settings** (radio name, DMR ID, …) — raw `0x00E0`.
+5. **General settings** — callsign + DMR ID done; remaining fields (boot text
+   `0x7540`/`0x7550`, monitor/VOX/timer toggles) pending.
 6. **DMR-ID database** (raw flash `0x30000`).
 7. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
    only a *from-source frozen rebuild* would also need the module added to
