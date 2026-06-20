@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+debug.log
+_dbg.txt
+_testout.txt
+_debug.py
+.pytest_cache/
