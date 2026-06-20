@@ -24,7 +24,17 @@ def _dmr_extra(cc=1, ts=1, contact=0, tg_list=0):
 
 
 def _extra_dict(mem):
-    return {s.get_name(): int(s.value) for s in (mem.extra or [])}
+    # cc/ts are integers; contact/tg_list are "idx: name" dropdowns (or "None").
+    d = {}
+    for s in (mem.extra or []):
+        v = str(s.value)
+        if ":" in v:
+            d[s.get_name()] = int(v.split(":")[0])
+        elif v.startswith("None"):
+            d[s.get_name()] = 0
+        else:
+            d[s.get_name()] = int(v)
+    return d
 
 
 def _fresh_radio():

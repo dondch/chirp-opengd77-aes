@@ -45,10 +45,11 @@ A module must be re-loaded each time you start CHIRP.
 ## Channels
 
 Channels (memories 1–1024, analog and DMR) are read and written through the
-normal CHIRP memory editor. DMR-specific fields (colour code, timeslot, contact
-index, RX-group index, and the privacy/key-selector byte) appear in each
-memory's *Extra* tab. Upload writes only the flash sectors that actually
-changed, and preserves OpenGD77-specific per-channel fields CHIRP doesn't expose.
+normal CHIRP memory editor. DMR-specific fields appear in each memory's *Extra*
+tab: colour code, timeslot, **Contact (TX talkgroup)** and **RX group list** as
+name dropdowns, and the privacy/key-selector byte. Upload writes only the flash
+sectors that actually changed, and preserves OpenGD77-specific per-channel
+fields CHIRP doesn't expose.
 
 > Digital/DTMF contacts, RX-group lists and the DMR-ID database are not written
 > yet — see [STATUS.md](STATUS.md).
@@ -65,6 +66,13 @@ Keys are entered and displayed in the **radio / CPS byte order**, which is the
 **reverse** of the byte order in an `aes256.dec` file. Enter the 64 hex
 characters exactly as the radio/CPS shows them (MSB first). If you have a key
 from an `aes256.dec`, reverse its 32 bytes before entering it here.
+
+## Contacts & RX groups
+
+*Settings → Contacts* lists the in-use digital contacts (plus a few spare slots
+for adding new ones); each has a name, a TG/ID number and a call type
+(Group/Private/All). Contacts and RX-group lists also populate the per-channel
+dropdowns described above. (Editing RX-group membership is still on the way.)
 
 ## General settings
 

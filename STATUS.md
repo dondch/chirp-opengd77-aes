@@ -26,11 +26,16 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   (MTOBankModel). Add/remove channels, rename, create new zones (up to 68).
   Auto-detects the 80- vs 16-channel-per-zone format. Channels keep their order
   within a zone.
+* **Digital contacts** (read/write) — Settings → Contacts lists in-use contacts
+  plus spare slots; each has name, TG/ID number (big-endian BCD) and call type
+  (Group/Private/All). A channel's **Contact** field is now a name **dropdown**.
+* **RX-group lists** (read) — a channel's **RX group list** field is a name
+  dropdown. (RX-group membership editing to follow.)
 * **Host tests, no hardware** — fake-radio fixture + AES codec round-trip,
   sibling-block preservation, BCD helpers, channel encode/decode round-trips,
   diff-only sector writes, unmanaged-byte preservation, general-settings
-  round-trip, zone create/membership/rename/multi-zone. `python run_tests.py`
-  → 22 passed.
+  round-trip, zone create/membership/rename/multi-zone, contact read/create,
+  RX-group read, channel contact/TG dropdowns. `python run_tests.py` → 26 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -64,6 +69,12 @@ decoded correctly. Zone format detected as 80-ch; the radio's existing zone
 (`Zone1` → ch 1) read correctly; created `ZZTESTZONE` → ch 1 in a free slot,
 read back, then restored the zone sectors byte-exact. ✔
 
+**Contacts + RX groups (2026-06-21, COM4):** read the radio's 6 contacts
+(e.g. `Parrot 9990`/Private, `OpenGD77 TG`/98977, `DCH_Group`/9661) and 2 RX
+groups (`Brandmeister`, `DMR MARC`) — names, BCD numbers and call types all
+correct; channel 1's Contact dropdown correctly resolved to `6: DCH_Group`.
+(Read-only check; contact write uses the same proven flash path + host tests.) ✔
+
 ## Write mechanism — solved
 
 The earlier channel-write blocker is resolved. On MD-UV380/390 the "EEPROM"
@@ -76,13 +87,13 @@ is no write-path blocker.
 
 ## Deferred (next phases)
 
-1. **Digital contacts** (24 B, 1024 max) — flash `0xA7620`.
-2. **RX group lists** (80 B, 76 max) — flash `0xAD620`.
-3. **DTMF contacts** (32 B, 63 max) — raw `0x2F88`.
-4. **General settings** — callsign + DMR ID done; remaining fields (boot text
+1. **RX-group membership editing** (read + channel dropdown done; editing the
+   group's contact list pending).
+2. **DTMF contacts** (32 B, 63 max) — raw `0x2F88`.
+3. **General settings** — callsign + DMR ID done; remaining fields (boot text
    `0x7540`/`0x7550`, monitor/VOX/timer toggles) pending.
-5. **DMR-ID database** (raw flash `0x30000`).
-6. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
+4. **DMR-ID database** (raw flash `0x30000`).
+5. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
    only a *from-source frozen rebuild* would also need the module added to
    `chirp/drivers/__init__.py:__all__` (not required for Load Module).
 

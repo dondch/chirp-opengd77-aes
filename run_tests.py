@@ -32,6 +32,11 @@ try:
 except Exception as e:  # pragma: no cover
     sys.exit("Cannot import chirp (set CHIRP_SRC to a CHIRP checkout): %s" % e)
 
+# The driver sleeps between USB chunks for real hardware; the fake radio needs
+# no delays, so neutralize them to keep the suite fast.
+import opengd77_aes as _drv  # noqa: E402
+_drv.time.sleep = lambda *a, **k: None
+
 
 def main():
     import tests as tests_pkg

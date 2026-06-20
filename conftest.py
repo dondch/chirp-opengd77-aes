@@ -21,3 +21,10 @@ _chirp_src = os.path.abspath(_chirp_src)
 if os.path.isdir(os.path.join(_chirp_src, "chirp")):
     sys.path.insert(0, _chirp_src)
 sys.path.insert(0, HERE)
+
+# Neutralize the driver's inter-chunk USB delays for the fake-radio tests.
+try:
+    import opengd77_aes as _drv
+    _drv.time.sleep = lambda *a, **k: None
+except Exception:
+    pass

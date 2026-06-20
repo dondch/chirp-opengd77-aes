@@ -44,6 +44,7 @@ from chirp.settings import (
     RadioSetting,
     RadioSettingValueBoolean,
     RadioSettingValueInteger,
+    RadioSettingValueList,
     RadioSettingValueString,
 )
 
@@ -109,6 +110,25 @@ ZONE_STRIDE_MAX = ZONE_NAME_LEN + 2 * ZONE_MAX_CH      # 176 (80-ch format)
 ZONE_DETECT_OFF = 0x806F - ZONE_BITMAP_ADDR            # 0x5F into the region
 ZONE_REGION_LEN = (ZONE_LIST_ADDR - ZONE_BITMAP_ADDR) + ZONES_MAX * ZONE_STRIDE_MAX
 
+# Digital contacts (flash). name[16] + tgNumber(BCD BE)[4] + callType + 2 misc.
+# In use when name[0] != 0xFF.
+CONTACT_ADDR = FLASH_OFFSET + 0x87620                   # 0xA7620
+CONTACT_SIZE = 24
+CONTACTS_MAX = 1024
+CONTACTS_REGION_LEN = CONTACTS_MAX * CONTACT_SIZE       # 24576
+CONTACT_TYPE_TG = 0
+CONTACT_TYPE_PC = 1
+CONTACT_TYPE_ALL = 2
+CONTACT_TYPES = ["Group Call", "Private Call", "All Call"]
+
+# RX group lists (flash). Length table (1 byte/group, >0 = in use) then the
+# groups (name[16] + contacts[32]:u16, 1-based contact index, 0 = end).
+RXGROUP_LEN_ADDR = FLASH_OFFSET + 0x8D620               # 0xAD620
+RXGROUP_ADDR = FLASH_OFFSET + 0x8D6A0                   # 0xAD6A0
+RXGROUP_SIZE = 80
+RXGROUPS_MAX = 76
+RXGROUP_REGION_LEN = (RXGROUP_ADDR - RXGROUP_LEN_ADDR) + RXGROUPS_MAX * RXGROUP_SIZE
+
 CSS_NONE = 0xFFFF
 
 # --------------------------------------------------------------------------
@@ -123,7 +143,9 @@ IMG_FLASH_CH = IMG_EE_CH + CH_PER_BANK * CH_SIZE     # 0x2C10
 FLASH_CH_LEN = (CH_BANKS - 1) * FLASH_BANK_STRIDE    # 7 banks = 50288
 IMG_GENSET = IMG_FLASH_CH + FLASH_CH_LEN             # 0xF080
 IMG_ZONE = IMG_GENSET + GENSET_LEN
-IMAGE_SIZE = IMG_ZONE + ZONE_REGION_LEN
+IMG_CONTACTS = IMG_ZONE + ZONE_REGION_LEN
+IMG_RXGROUP = IMG_CONTACTS + CONTACTS_REGION_LEN
+IMAGE_SIZE = IMG_RXGROUP + RXGROUP_REGION_LEN
 
 _RANGES = [
     # (image_offset, area, device_addr, length)
@@ -133,6 +155,8 @@ _RANGES = [
     (IMG_FLASH_CH, AREA_FLASH, FLASH_CH_BITMAP_ADDR, FLASH_CH_LEN),
     (IMG_GENSET, AREA_EEPROM, GENSET_ADDR, GENSET_LEN),
     (IMG_ZONE, AREA_EEPROM, ZONE_BITMAP_ADDR, ZONE_REGION_LEN),
+    (IMG_CONTACTS, AREA_FLASH, CONTACT_ADDR, CONTACTS_REGION_LEN),
+    (IMG_RXGROUP, AREA_FLASH, RXGROUP_LEN_ADDR, RXGROUP_REGION_LEN),
 ]
 
 # Writable spans: (image_offset, raw_flash_addr, length).  All written through
@@ -144,6 +168,7 @@ _WRITE_SPANS = [
     (IMG_FLASH_CH, FLASH_CH_BITMAP_ADDR, FLASH_CH_LEN),
     (IMG_GENSET, GENSET_ADDR, GENSET_LEN),
     (IMG_ZONE, ZONE_BITMAP_ADDR, ZONE_REGION_LEN),
+    (IMG_CONTACTS, CONTACT_ADDR, CONTACTS_REGION_LEN),
 ]
 
 HEX = "0123456789abcdefABCDEF"
@@ -453,9 +478,10 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         rp.experimental = (
             "This driver targets the OpenGD77-AES256 firmware.  Supported: "
             "AES-256 key management (Settings -> AES Keys), channel read/write "
-            "(memories 1-1024, analog + DMR), zones (as banks) and the radio "
-            "callsign / DMR ID (Settings -> Radio).  Digital/DTMF contacts, "
-            "RX-group lists and the DMR-ID database are still in development.\n\n"
+            "(memories 1-1024, analog + DMR), zones (as banks), digital "
+            "contacts and the radio callsign / DMR ID.  DTMF contacts, RX-group "
+            "membership editing and the DMR-ID database are still in "
+            "development.\n\n"
             "AES voice encryption is only legal on licensed commercial / PMR "
             "allocations -- NOT on amateur (ham) bands.")
         rp.pre_download = (
@@ -570,8 +596,9 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             _close_cps(pipe)
 
     def process_mmap(self):
-        # Channels are parsed on demand in get_memory(); nothing to precompute.
-        pass
+        # Channels are parsed on demand in get_memory(); precompute the contact
+        # and RX-group name caches used for channel dropdowns.
+        self._build_caches()
 
     # -- AES key store access on the image ------------------------------
     def _aes_region(self):
@@ -678,30 +705,38 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                                           else "N")
 
     @staticmethod
-    def _add_dmr_extras(mem, raw):
+    def _index_list(items, current_index):
+        """Build (options, current) for a 'idx: name' dropdown with a None entry,
+        ensuring the current index is always representable."""
+        options = ["None"] + ["%d: %s" % (i, n) for i, n in items]
+        current = "None"
+        if current_index:
+            current = next(("%d: %s" % (i, n) for i, n in items
+                            if i == current_index), None)
+            if current is None:
+                current = "%d: ?" % current_index
+                options.append(current)
+        return options, current
+
+    def _add_dmr_extras(self, mem, raw):
         group = RadioSettingGroup("dmr", "DMR")
-        flag1 = raw[38]
-        optional_dmrid = bool(flag1 & 0x80)
-        cc = raw[44] & 0x0F
-        ts = 2 if (raw[49] & 0x40) else 1
-        contact = struct.unpack_from("<H", raw, 46)[0]
-        if contact > 1024:                  # 0xFFFF / unset -> show "none"
-            contact = 0
-        tg_list = raw[43]
-        if tg_list > 76:                    # 0xFF / unset -> show "none"
-            tg_list = 0
+        optional_dmrid = bool(raw[38] & 0x80)
         group.append(RadioSetting(
             "cc", "Colour code",
-            RadioSettingValueInteger(0, 15, cc)))
+            RadioSettingValueInteger(0, 15, raw[44] & 0x0F)))
         group.append(RadioSetting(
             "ts", "Timeslot",
-            RadioSettingValueInteger(1, 2, ts)))
-        group.append(RadioSetting(
-            "contact", "Contact index",
-            RadioSettingValueInteger(0, 1024, contact)))
-        group.append(RadioSetting(
-            "tg_list", "RX group (TG list) index",
-            RadioSettingValueInteger(0, 76, tg_list)))
+            RadioSettingValueInteger(1, 2, 2 if (raw[49] & 0x40) else 1)))
+
+        opts, cur = self._index_list(getattr(self, "_contacts", []),
+                                     struct.unpack_from("<H", raw, 46)[0])
+        group.append(RadioSetting("contact", "Contact (TX talkgroup)",
+                                  RadioSettingValueList(opts, cur)))
+
+        opts, cur = self._index_list(getattr(self, "_rxgroups", []), raw[43])
+        group.append(RadioSetting("tg_list", "RX group list",
+                                  RadioSettingValueList(opts, cur)))
+
         if not optional_dmrid:
             group.append(RadioSetting(
                 "encrypt", "Privacy / AES key selector (encrypt byte)",
@@ -768,9 +803,10 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 raw[49] = (raw[49] | 0x40) if int(ex["ts"]) == 2 \
                     else (raw[49] & ~0x40) & 0xFF
             if "contact" in ex:
-                struct.pack_into("<H", raw, 46, int(ex["contact"]) & 0xFFFF)
+                struct.pack_into("<H", raw, 46,
+                                 self._parse_index(ex["contact"]) & 0xFFFF)
             if "tg_list" in ex:
-                raw[43] = int(ex["tg_list"]) & 0xFF
+                raw[43] = self._parse_index(ex["tg_list"]) & 0xFF
             if "encrypt" in ex:
                 raw[41] = int(ex["encrypt"]) & 0xFF
 
@@ -871,6 +907,56 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
     def _zone_set_name(self, i, name):
         self._zone_write(i, name, self._zone_channel_list(i))
 
+    # -- contacts & RX groups -------------------------------------------
+    def _contact_off(self, i):
+        return IMG_CONTACTS + (i - 1) * CONTACT_SIZE
+
+    def _contact_inuse(self, img, i):
+        return img[self._contact_off(i)] != 0xFF
+
+    def _contact_name(self, img, i):
+        o = self._contact_off(i)
+        return _decode_name(img[o:o + 16])
+
+    def _contact_get(self, img, i):
+        o = self._contact_off(i)
+        name = _decode_name(img[o:o + 16])
+        num = _bcd2int(int.from_bytes(img[o + 16:o + 20], "big"))
+        if not (0 <= num <= 16777215):
+            num = 0
+        ctype = img[o + 20] if img[o + 20] < len(CONTACT_TYPES) else 0
+        return name, num, ctype
+
+    def _rxgroup_off(self, i):
+        return IMG_RXGROUP + (RXGROUP_ADDR - RXGROUP_LEN_ADDR) + (i - 1) * RXGROUP_SIZE
+
+    def _rxgroup_inuse(self, img, i):
+        n = img[IMG_RXGROUP + (i - 1)]      # length-table byte
+        return 0 < n <= 32
+
+    def _rxgroup_name(self, img, i):
+        o = self._rxgroup_off(i)
+        return _decode_name(img[o:o + 16])
+
+    def _build_caches(self):
+        img = self._mmap.get_packed()
+        self._contacts = [(i, self._contact_name(img, i))
+                          for i in range(1, CONTACTS_MAX + 1)
+                          if self._contact_inuse(img, i)]
+        self._rxgroups = [(i, self._rxgroup_name(img, i))
+                          for i in range(1, RXGROUPS_MAX + 1)
+                          if self._rxgroup_inuse(img, i)]
+
+    @staticmethod
+    def _parse_index(value):
+        s = str(value)
+        if s.startswith("None"):
+            return 0
+        try:
+            return int(s.split(":", 1)[0])
+        except ValueError:
+            return 0
+
     # -- settings: general + AES key store ------------------------------
     def _get_radio_settings(self):
         gs = self._mmap.get_packed()[IMG_GENSET:IMG_GENSET + GENSET_LEN]
@@ -887,8 +973,31 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             RadioSettingValueInteger(0, 16777215, dmrid)))
         return radio
 
+    def _get_contacts_settings(self):
+        img = self._mmap.get_packed()
+        group = RadioSettingGroup("contacts", "Contacts")
+        inuse = [i for i in range(1, CONTACTS_MAX + 1)
+                 if self._contact_inuse(img, i)]
+        spares = [i for i in range(1, CONTACTS_MAX + 1)
+                  if not self._contact_inuse(img, i)][:8]
+        for i in sorted(set(inuse) | set(spares)):
+            name, num, ctype = self._contact_get(img, i)
+            sub = RadioSettingGroup("contact_%d" % i, "Contact %d" % i)
+            sub.append(RadioSetting(
+                "contact_%d_name" % i, "Name",
+                RadioSettingValueString(0, 16, name, autopad=False)))
+            sub.append(RadioSetting(
+                "contact_%d_num" % i, "Number (TG/ID)",
+                RadioSettingValueInteger(0, 16777215, num)))
+            sub.append(RadioSetting(
+                "contact_%d_type" % i, "Type",
+                RadioSettingValueList(CONTACT_TYPES, CONTACT_TYPES[ctype])))
+            group.append(sub)
+        return group
+
     def get_settings(self):
         radio = self._get_radio_settings()
+        contacts = self._get_contacts_settings()
         store = self._read_aes_store()
         aes = RadioSettingGroup("aes", "AES Keys")
 
@@ -915,7 +1024,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 "aes_key_%d" % i, "Key id %d (64 hex)" % i,
                 RadioSettingValueString(0, 64, slot.key_hex,
                                         autopad=False, charset=HEX)))
-        return RadioSettings(radio, aes)
+        return RadioSettings(radio, contacts, aes)
 
     def set_settings(self, settings):
         flat = {}
@@ -937,6 +1046,28 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         if "dmrid" in flat:
             img[IMG_GENSET + 8:IMG_GENSET + 12] = \
                 _int2bcd(int(flat["dmrid"].value)).to_bytes(4, "big")
+
+        # -- contacts --
+        for i in range(1, CONTACTS_MAX + 1):
+            nk = "contact_%d_name" % i
+            if nk not in flat:
+                continue
+            o = IMG_CONTACTS + (i - 1) * CONTACT_SIZE
+            name = str(flat[nk].value).strip()
+            if name:
+                was = img[o] != 0xFF
+                img[o:o + 16] = _encode_name(name, 16)
+                num = int(flat["contact_%d_num" % i].value)
+                img[o + 16:o + 20] = _int2bcd(num).to_bytes(4, "big")
+                tstr = str(flat["contact_%d_type" % i].value)
+                img[o + 20] = (CONTACT_TYPES.index(tstr)
+                               if tstr in CONTACT_TYPES else 0)
+                if not was:
+                    img[o + 21] = 0          # callRxTone
+                    img[o + 22] = 0          # ringStyle
+                    img[o + 23] = 0xFF       # reserve1 (no TS override)
+            else:
+                img[o:o + CONTACT_SIZE] = b"\xFF" * CONTACT_SIZE
 
         # -- AES key store --
         store = AesKeyStore.from_payload(
@@ -970,6 +1101,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         img[IMG_AES:IMG_AES + SECTOR_SIZE] = region
 
         self._mmap = memmap.MemoryMapBytes(bytes(img))
+        self._build_caches()      # contact/RX-group edits affect channel dropdowns
 
 
 # --------------------------------------------------------------------------
