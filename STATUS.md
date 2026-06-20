@@ -19,6 +19,28 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   sibling-block preservation, BCD helpers, end-to-end download/edit/upload.
   `python run_tests.py` → 10 passed.
 
+## On-hardware test result (2026-06-20, COM4)
+
+Verified against a real MD-UV390 10W Plus running OpenGD77-AES256
+(git `c543c86`, built 20260620143151):
+
+* **Detect:** `RADIO_INFO` returns `radioType=6` — confirmed. ✔
+* **AES read:** custom-data region read OK (magic `OpenGD77`, AES block at +12);
+  existing store read back correctly (`tx_key_id=1`, KEY1 in slot 0). ✔
+* **AES write (low-level + driver path):** wrote a test key into a free slot,
+  read-back byte-exact, test key persisted to flash, existing KEY1 untouched,
+  sibling region preserved — via both the raw protocol and the
+  `set_settings`→`sync_out` GUI path. ✔
+* **Channel read:** full `sync_in` OK; decoded the in-use channel
+  (`PMR01`, 446.00625 MHz, DMR). ✔
+* **Restore:** original AES sector written back and verified byte-exact; radio
+  left exactly as found (only KEY1 present). ✔
+
+Still requires a human (RF/functional, can't be automated here): reboot the
+radio and confirm KEY1 still decrypts a stock encrypted call after a real
+key-edit upload. The byte-exact restore shows KEY1 is unmodified by the
+round-trip.
+
 ## Deferred (next phases)
 
 1. **Channel write.** Banks 1–7 (channels 129–1024) are plain flash writes and
