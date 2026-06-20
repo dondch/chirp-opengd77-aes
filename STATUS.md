@@ -22,10 +22,15 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
 * **General settings — callsign + DMR ID** (Settings → Radio), read/write.
   DMR ID is big-endian BCD; callsign is an 8-char padded string. (More
   general-settings fields — boot text, toggles — to follow.)
+* **Zones → CHIRP banks** (read/write). A channel can belong to several zones
+  (MTOBankModel). Add/remove channels, rename, create new zones (up to 68).
+  Auto-detects the 80- vs 16-channel-per-zone format. Channels keep their order
+  within a zone.
 * **Host tests, no hardware** — fake-radio fixture + AES codec round-trip,
   sibling-block preservation, BCD helpers, channel encode/decode round-trips,
   diff-only sector writes, unmanaged-byte preservation, general-settings
-  round-trip, end-to-end download/edit/upload. `python run_tests.py` → 18 passed.
+  round-trip, zone create/membership/rename/multi-zone. `python run_tests.py`
+  → 22 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -54,6 +59,11 @@ round-trip.
 changed EEPROM sector written), read back byte-exact, existing PMR01 untouched;
 the EEPROM channel sectors were then restored byte-exact. ✔
 
+**General settings + zones (2026-06-21, COM4):** callsign (`GD77`) and DMR ID
+decoded correctly. Zone format detected as 80-ch; the radio's existing zone
+(`Zone1` → ch 1) read correctly; created `ZZTESTZONE` → ch 1 in a free slot,
+read back, then restored the zone sectors byte-exact. ✔
+
 ## Write mechanism — solved
 
 The earlier channel-write blocker is resolved. On MD-UV380/390 the "EEPROM"
@@ -66,14 +76,13 @@ is no write-path blocker.
 
 ## Deferred (next phases)
 
-1. **Zones** (176 B, 80 ch/zone, 68 max + bitmap at `0x8010`, list at `0x8030`).
+1. **Digital contacts** (24 B, 1024 max) — flash `0xA7620`.
 2. **RX group lists** (80 B, 76 max) — flash `0xAD620`.
-3. **Digital contacts** (24 B, 1024 max) — flash `0xA7620`.
-4. **DTMF contacts** (32 B, 63 max) — raw `0x2F88`.
-5. **General settings** — callsign + DMR ID done; remaining fields (boot text
+3. **DTMF contacts** (32 B, 63 max) — raw `0x2F88`.
+4. **General settings** — callsign + DMR ID done; remaining fields (boot text
    `0x7540`/`0x7550`, monitor/VOX/timer toggles) pending.
-6. **DMR-ID database** (raw flash `0x30000`).
-7. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
+5. **DMR-ID database** (raw flash `0x30000`).
+6. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
    only a *from-source frozen rebuild* would also need the module added to
    `chirp/drivers/__init__.py:__all__` (not required for Load Module).
 

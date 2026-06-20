@@ -96,6 +96,19 @@ FLASH_BANK_STRIDE = 16 + CH_PER_BANK * CH_SIZE       # 7184
 GENSET_ADDR = 0x00E0            # callsign[8] @0xE0, radioId(BCD BE)[4] @0xE8
 GENSET_LEN = 40
 
+# Zones (EEPROM region). In-use bitmap @0x8010 (32 B), zone list @0x8030.
+# Each zone: name[16] + channels[cpz]:u16 (1-based, 0 = end). cpz is 80 for the
+# OpenGD77 format (16 for the legacy format), detected from the byte at 0x806F.
+ZONE_BITMAP_ADDR = 0x8010
+ZONE_BITMAP_LEN = 32
+ZONE_LIST_ADDR = 0x8030
+ZONES_MAX = 68
+ZONE_NAME_LEN = 16
+ZONE_MAX_CH = 80
+ZONE_STRIDE_MAX = ZONE_NAME_LEN + 2 * ZONE_MAX_CH      # 176 (80-ch format)
+ZONE_DETECT_OFF = 0x806F - ZONE_BITMAP_ADDR            # 0x5F into the region
+ZONE_REGION_LEN = (ZONE_LIST_ADDR - ZONE_BITMAP_ADDR) + ZONES_MAX * ZONE_STRIDE_MAX
+
 CSS_NONE = 0xFFFF
 
 # --------------------------------------------------------------------------
@@ -109,7 +122,8 @@ IMG_EE_CH = IMG_EE_BITMAP + 16                       # 0x1010
 IMG_FLASH_CH = IMG_EE_CH + CH_PER_BANK * CH_SIZE     # 0x2C10
 FLASH_CH_LEN = (CH_BANKS - 1) * FLASH_BANK_STRIDE    # 7 banks = 50288
 IMG_GENSET = IMG_FLASH_CH + FLASH_CH_LEN             # 0xF080
-IMAGE_SIZE = IMG_GENSET + GENSET_LEN
+IMG_ZONE = IMG_GENSET + GENSET_LEN
+IMAGE_SIZE = IMG_ZONE + ZONE_REGION_LEN
 
 _RANGES = [
     # (image_offset, area, device_addr, length)
@@ -118,6 +132,7 @@ _RANGES = [
     (IMG_EE_CH, AREA_EEPROM, EE_CH_DATA_ADDR, CH_PER_BANK * CH_SIZE),
     (IMG_FLASH_CH, AREA_FLASH, FLASH_CH_BITMAP_ADDR, FLASH_CH_LEN),
     (IMG_GENSET, AREA_EEPROM, GENSET_ADDR, GENSET_LEN),
+    (IMG_ZONE, AREA_EEPROM, ZONE_BITMAP_ADDR, ZONE_REGION_LEN),
 ]
 
 # Writable spans: (image_offset, raw_flash_addr, length).  All written through
@@ -128,6 +143,7 @@ _WRITE_SPANS = [
     (IMG_EE_BITMAP, EE_CH_BITMAP_ADDR, 16 + CH_PER_BANK * CH_SIZE),
     (IMG_FLASH_CH, FLASH_CH_BITMAP_ADDR, FLASH_CH_LEN),
     (IMG_GENSET, GENSET_ADDR, GENSET_LEN),
+    (IMG_ZONE, ZONE_BITMAP_ADDR, ZONE_REGION_LEN),
 ]
 
 HEX = "0123456789abcdefABCDEF"
@@ -436,9 +452,10 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         rp = chirp_common.RadioPrompts()
         rp.experimental = (
             "This driver targets the OpenGD77-AES256 firmware.  Supported: "
-            "AES-256 key management (Settings -> AES Keys) and channel "
-            "read/write (memories 1-1024, analog + DMR).  Zones, contacts, RX "
-            "groups and other codeplug objects are still in development.\n\n"
+            "AES-256 key management (Settings -> AES Keys), channel read/write "
+            "(memories 1-1024, analog + DMR), zones (as banks) and the radio "
+            "callsign / DMR ID (Settings -> Radio).  Digital/DTMF contacts, "
+            "RX-group lists and the DMR-ID database are still in development.\n\n"
             "AES voice encryption is only legal on licensed commercial / PMR "
             "allocations -- NOT on amateur (ham) bands.")
         rp.pre_download = (
@@ -454,7 +471,8 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
     def get_features(self):
         rf = chirp_common.RadioFeatures()
         rf.has_settings = True
-        rf.has_bank = False
+        rf.has_bank = True
+        rf.has_bank_names = True
         rf.has_sub_devices = False
         rf.has_ctone = True
         rf.has_cross = False
@@ -782,6 +800,77 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             rx = css_dtcs(mem.dtcs, pol[1])
         return tx, rx
 
+    # -- zones (CHIRP banks) --------------------------------------------
+    def get_bank_model(self):
+        return OpenGD77BankModel(self, "Zones")
+
+    def _channels_per_zone(self):
+        b = self._mmap.get_packed()[IMG_ZONE + ZONE_DETECT_OFF]
+        return 80 if b <= 0x04 else 16
+
+    def _zone_stride(self):
+        return ZONE_NAME_LEN + 2 * self._channels_per_zone()
+
+    def _zone_inuse(self, img, i):
+        return bool((img[IMG_ZONE + i // 8] >> (i % 8)) & 0x01)
+
+    def _zone_slot(self, i):
+        return IMG_ZONE + ZONE_BITMAP_LEN + i * self._zone_stride()
+
+    def _zone_name(self, img, i):
+        o = self._zone_slot(i)
+        return _decode_name(img[o:o + ZONE_NAME_LEN])
+
+    def _zone_label(self, img, i):
+        return self._zone_name(img, i) or ("Zone %d" % (i + 1))
+
+    def _zone_channel_list(self, i):
+        img = self._mmap.get_packed()
+        if not self._zone_inuse(img, i):
+            return []
+        cpz = self._channels_per_zone()
+        base = self._zone_slot(i) + ZONE_NAME_LEN
+        out = []
+        for k in range(cpz):
+            ch = struct.unpack_from("<H", img, base + k * 2)[0]
+            if ch == 0:
+                break
+            out.append(ch)
+        return out
+
+    def _zone_write(self, i, name, channels):
+        img = bytearray(self._mmap.get_packed())
+        cpz = self._channels_per_zone()
+        o = self._zone_slot(i)
+        img[o:o + ZONE_NAME_LEN] = _encode_name(name, ZONE_NAME_LEN)
+        base = o + ZONE_NAME_LEN
+        for k in range(cpz):
+            ch = channels[k] if k < len(channels) else 0
+            struct.pack_into("<H", img, base + k * 2, ch)
+        bmbyte = IMG_ZONE + i // 8
+        if channels or name:
+            img[bmbyte] |= (1 << (i % 8))
+        else:
+            img[bmbyte] = img[bmbyte] & ~(1 << (i % 8)) & 0xFF
+        self._mmap = memmap.MemoryMapBytes(bytes(img))
+
+    def _zone_add(self, i, ch):
+        chans = self._zone_channel_list(i)
+        if ch not in chans:
+            chans.append(ch)
+        self._zone_write(i, self._zone_label(self._mmap.get_packed(), i), chans)
+
+    def _zone_remove(self, i, ch):
+        chans = [c for c in self._zone_channel_list(i) if c != ch]
+        name = self._zone_name(self._mmap.get_packed(), i)
+        if not chans and not name:
+            self._zone_write(i, "", [])
+        else:
+            self._zone_write(i, name or ("Zone %d" % (i + 1)), chans)
+
+    def _zone_set_name(self, i, name):
+        self._zone_write(i, name, self._zone_channel_list(i))
+
     # -- settings: general + AES key store ------------------------------
     def _get_radio_settings(self):
         gs = self._mmap.get_packed()[IMG_GENSET:IMG_GENSET + GENSET_LEN]
@@ -881,3 +970,40 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         img[IMG_AES:IMG_AES + SECTOR_SIZE] = region
 
         self._mmap = memmap.MemoryMapBytes(bytes(img))
+
+
+# --------------------------------------------------------------------------
+# Zones surface as CHIRP banks (a channel may be in several zones).
+# --------------------------------------------------------------------------
+class OpenGD77Bank(chirp_common.NamedBank):
+    def set_name(self, name):
+        chirp_common.NamedBank.set_name(self, name)
+        self._model._radio._zone_set_name(self.get_index(), name)
+
+
+class OpenGD77BankModel(chirp_common.MTOBankModel):
+    def get_num_mappings(self):
+        return ZONES_MAX
+
+    def get_mappings(self):
+        img = self._radio._mmap.get_packed()
+        return [OpenGD77Bank(self, i, self._radio._zone_label(img, i))
+                for i in range(ZONES_MAX)]
+
+    def add_memory_to_mapping(self, memory, mapping):
+        self._radio._zone_add(mapping.get_index(), memory.number)
+
+    def remove_memory_from_mapping(self, memory, mapping):
+        self._radio._zone_remove(mapping.get_index(), memory.number)
+
+    def get_mapping_memories(self, mapping):
+        return [self._radio.get_memory(n)
+                for n in self._radio._zone_channel_list(mapping.get_index())]
+
+    def get_memory_mappings(self, memory):
+        img = self._radio._mmap.get_packed()
+        out = []
+        for i in range(ZONES_MAX):
+            if memory.number in self._radio._zone_channel_list(i):
+                out.append(OpenGD77Bank(self, i, self._radio._zone_label(img, i)))
+        return out

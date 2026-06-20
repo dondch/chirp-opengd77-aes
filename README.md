@@ -50,8 +50,14 @@ index, RX-group index, and the privacy/key-selector byte) appear in each
 memory's *Extra* tab. Upload writes only the flash sectors that actually
 changed, and preserves OpenGD77-specific per-channel fields CHIRP doesn't expose.
 
-> Zones, digital/DTMF contacts, RX-group lists, general settings and the DMR-ID
-> database are not written yet — see [STATUS.md](STATUS.md).
+> Digital/DTMF contacts, RX-group lists and the DMR-ID database are not written
+> yet — see [STATUS.md](STATUS.md).
+
+## Zones
+
+Zones appear as **banks** in CHIRP's bank view. A channel can belong to several
+zones; you can add/remove channels, rename a zone, and create new zones (up to
+68). The driver auto-detects the radio's 80- or 16-channels-per-zone format.
 
 ### Key byte order (important)
 

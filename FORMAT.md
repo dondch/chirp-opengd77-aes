@@ -131,7 +131,10 @@ Optional per-channel DMR ID: when `flag1(LibreDMR_flag1) bit7` set,
 
 ## Other structures (sizes; layout to be detailed in their build phases)
 
-* Zone (OpenGD77): 176 B — `name[16]` + `channels[80]:u16`. Max 68 zones + virtual "All channels".
+* Zone: in-use bitmap (32 B) at EEPROM `0x8010`; list at `0x8030`, stride
+  `16 + 2*cpz` per zone (`cpz` = 80 OpenGD77 / 16 legacy, detected from the byte
+  at `0x806F` ≤ 0x04 ⇒ 80). Each zone = `name[16]` + `channels[cpz]:u16`
+  (1-based channel index, 0 = end). Max 68 zones + a virtual "All channels".
 * RX group list: 80 B — `name[16]` + `contacts[32]:u16`. Max 76.
 * Digital contact: 24 B — `name[16]` + `tgNumber:u32` + `callType:u8` + `callRxTone:u8` +
   `ringStyle:u8` + `reserve1:u8 (TS override)`. Max 1024.
