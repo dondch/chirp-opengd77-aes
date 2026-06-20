@@ -129,6 +129,19 @@ RXGROUP_SIZE = 80
 RXGROUPS_MAX = 76
 RXGROUP_REGION_LEN = (RXGROUP_ADDR - RXGROUP_LEN_ADDR) + RXGROUPS_MAX * RXGROUP_SIZE
 
+# DTMF contacts (EEPROM region). name[16] + code[16] (digit per byte, 0xFF=end).
+# In use when the first byte is not 0xFF/0x00.
+DTMF_ADDR = 0x2F88
+DTMF_SIZE = 32
+DTMF_MAX = 63
+DTMF_REGION_LEN = DTMF_MAX * DTMF_SIZE                  # 2016
+DTMF_DIGITS = "0123456789ABCD*#"
+
+# Boot screen (EEPROM region): two text lines + an intro-type byte.
+BOOT_LINES_ADDR = 0x7540                                # line1[16] @0x7540, line2[16] @0x7550
+BOOT_LINES_LEN = 32
+BOOT_INTRO_ADDR = 0x7518                                # 0x01 = text, 0x00 = picture
+
 CSS_NONE = 0xFFFF
 
 # --------------------------------------------------------------------------
@@ -145,7 +158,10 @@ IMG_GENSET = IMG_FLASH_CH + FLASH_CH_LEN             # 0xF080
 IMG_ZONE = IMG_GENSET + GENSET_LEN
 IMG_CONTACTS = IMG_ZONE + ZONE_REGION_LEN
 IMG_RXGROUP = IMG_CONTACTS + CONTACTS_REGION_LEN
-IMAGE_SIZE = IMG_RXGROUP + RXGROUP_REGION_LEN
+IMG_DTMF = IMG_RXGROUP + RXGROUP_REGION_LEN
+IMG_BOOT = IMG_DTMF + DTMF_REGION_LEN
+IMG_BOOTTYPE = IMG_BOOT + BOOT_LINES_LEN
+IMAGE_SIZE = IMG_BOOTTYPE + 1
 
 _RANGES = [
     # (image_offset, area, device_addr, length)
@@ -157,6 +173,9 @@ _RANGES = [
     (IMG_ZONE, AREA_EEPROM, ZONE_BITMAP_ADDR, ZONE_REGION_LEN),
     (IMG_CONTACTS, AREA_FLASH, CONTACT_ADDR, CONTACTS_REGION_LEN),
     (IMG_RXGROUP, AREA_FLASH, RXGROUP_LEN_ADDR, RXGROUP_REGION_LEN),
+    (IMG_DTMF, AREA_EEPROM, DTMF_ADDR, DTMF_REGION_LEN),
+    (IMG_BOOT, AREA_EEPROM, BOOT_LINES_ADDR, BOOT_LINES_LEN),
+    (IMG_BOOTTYPE, AREA_EEPROM, BOOT_INTRO_ADDR, 1),
 ]
 
 # Writable spans: (image_offset, raw_flash_addr, length).  All written through
@@ -169,6 +188,9 @@ _WRITE_SPANS = [
     (IMG_GENSET, GENSET_ADDR, GENSET_LEN),
     (IMG_ZONE, ZONE_BITMAP_ADDR, ZONE_REGION_LEN),
     (IMG_CONTACTS, CONTACT_ADDR, CONTACTS_REGION_LEN),
+    (IMG_DTMF, DTMF_ADDR, DTMF_REGION_LEN),
+    (IMG_BOOT, BOOT_LINES_ADDR, BOOT_LINES_LEN),
+    (IMG_BOOTTYPE, BOOT_INTRO_ADDR, 1),
 ]
 
 HEX = "0123456789abcdefABCDEF"
@@ -478,9 +500,9 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         rp.experimental = (
             "This driver targets the OpenGD77-AES256 firmware.  Supported: "
             "AES-256 key management (Settings -> AES Keys), channel read/write "
-            "(memories 1-1024, analog + DMR), zones (as banks), digital "
-            "contacts and the radio callsign / DMR ID.  DTMF contacts, RX-group "
-            "membership editing and the DMR-ID database are still in "
+            "(memories 1-1024, analog + DMR), zones (as banks), digital + DTMF "
+            "contacts, and radio settings (callsign, DMR ID, boot screen).  "
+            "RX-group membership editing and the DMR-ID database are still in "
             "development.\n\n"
             "AES voice encryption is only legal on licensed commercial / PMR "
             "allocations -- NOT on amateur (ham) bands.")
@@ -938,6 +960,24 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         o = self._rxgroup_off(i)
         return _decode_name(img[o:o + 16])
 
+    def _dtmf_off(self, i):
+        return IMG_DTMF + (i - 1) * DTMF_SIZE
+
+    def _dtmf_inuse(self, img, i):
+        b = img[self._dtmf_off(i)]
+        return b != 0xFF and b != 0x00
+
+    def _dtmf_get(self, img, i):
+        o = self._dtmf_off(i)
+        name = _decode_name(img[o:o + 16])
+        code = []
+        for k in range(16):
+            v = img[o + 16 + k]
+            if v == 0xFF:
+                break
+            code.append(DTMF_DIGITS[v] if v < len(DTMF_DIGITS) else "?")
+        return name, "".join(code)
+
     def _build_caches(self):
         img = self._mmap.get_packed()
         self._contacts = [(i, self._contact_name(img, i))
@@ -971,7 +1011,41 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         radio.append(RadioSetting(
             "dmrid", "DMR ID",
             RadioSettingValueInteger(0, 16777215, dmrid)))
+
+        img = self._mmap.get_packed()
+        radio.append(RadioSetting(
+            "boot_line1", "Boot text line 1",
+            RadioSettingValueString(0, 16, _decode_name(img[IMG_BOOT:IMG_BOOT + 16]),
+                                    autopad=False)))
+        radio.append(RadioSetting(
+            "boot_line2", "Boot text line 2",
+            RadioSettingValueString(0, 16,
+                                    _decode_name(img[IMG_BOOT + 16:IMG_BOOT + 32]),
+                                    autopad=False)))
+        radio.append(RadioSetting(
+            "boot_screen", "Boot screen",
+            RadioSettingValueList(["Picture", "Text"],
+                                  "Text" if img[IMG_BOOTTYPE] == 1 else "Picture")))
         return radio
+
+    def _get_dtmf_settings(self):
+        img = self._mmap.get_packed()
+        group = RadioSettingGroup("dtmf", "DTMF Contacts")
+        inuse = [i for i in range(1, DTMF_MAX + 1) if self._dtmf_inuse(img, i)]
+        spares = [i for i in range(1, DTMF_MAX + 1)
+                  if not self._dtmf_inuse(img, i)][:4]
+        for i in sorted(set(inuse) | set(spares)):
+            name, code = self._dtmf_get(img, i)
+            sub = RadioSettingGroup("dtmf_%d" % i, "DTMF %d" % i)
+            sub.append(RadioSetting(
+                "dtmf_%d_name" % i, "Name",
+                RadioSettingValueString(0, 16, name, autopad=False)))
+            sub.append(RadioSetting(
+                "dtmf_%d_code" % i, "Code (0-9 A-D * #)",
+                RadioSettingValueString(0, 16, code, autopad=False,
+                                        charset=DTMF_DIGITS)))
+            group.append(sub)
+        return group
 
     def _get_contacts_settings(self):
         img = self._mmap.get_packed()
@@ -998,6 +1072,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
     def get_settings(self):
         radio = self._get_radio_settings()
         contacts = self._get_contacts_settings()
+        dtmf = self._get_dtmf_settings()
         store = self._read_aes_store()
         aes = RadioSettingGroup("aes", "AES Keys")
 
@@ -1024,7 +1099,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 "aes_key_%d" % i, "Key id %d (64 hex)" % i,
                 RadioSettingValueString(0, 64, slot.key_hex,
                                         autopad=False, charset=HEX)))
-        return RadioSettings(radio, contacts, aes)
+        return RadioSettings(radio, contacts, dtmf, aes)
 
     def set_settings(self, settings):
         flat = {}
@@ -1046,6 +1121,32 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         if "dmrid" in flat:
             img[IMG_GENSET + 8:IMG_GENSET + 12] = \
                 _int2bcd(int(flat["dmrid"].value)).to_bytes(4, "big")
+        if "boot_line1" in flat:
+            img[IMG_BOOT:IMG_BOOT + 16] = _encode_name(
+                str(flat["boot_line1"].value), 16)
+        if "boot_line2" in flat:
+            img[IMG_BOOT + 16:IMG_BOOT + 32] = _encode_name(
+                str(flat["boot_line2"].value), 16)
+        if "boot_screen" in flat:
+            img[IMG_BOOTTYPE] = 1 if str(flat["boot_screen"].value) == "Text" else 0
+
+        # -- DTMF contacts --
+        for i in range(1, DTMF_MAX + 1):
+            nk = "dtmf_%d_name" % i
+            if nk not in flat:
+                continue
+            o = IMG_DTMF + (i - 1) * DTMF_SIZE
+            name = str(flat[nk].value).strip()
+            if name:
+                img[o:o + 16] = _encode_name(name, 16)
+                code = str(flat["dtmf_%d_code" % i].value).strip().upper()
+                cb = bytearray(b"\xFF" * 16)
+                for k, ch in enumerate(code[:16]):
+                    if ch in DTMF_DIGITS:
+                        cb[k] = DTMF_DIGITS.index(ch)
+                img[o + 16:o + 32] = bytes(cb)
+            else:
+                img[o:o + DTMF_SIZE] = b"\xFF" * DTMF_SIZE
 
         # -- contacts --
         for i in range(1, CONTACTS_MAX + 1):

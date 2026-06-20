@@ -74,10 +74,14 @@ for adding new ones); each has a name, a TG/ID number and a call type
 (Group/Private/All). Contacts and RX-group lists also populate the per-channel
 dropdowns described above. (Editing RX-group membership is still on the way.)
 
+*Settings → DTMF Contacts* manages DTMF contacts (name + a code of 0-9, A-D,
+\* and #).
+
 ## General settings
 
-*Settings → Radio* exposes the radio **callsign** and **DMR ID** (read/write).
-More general-settings fields and the other codeplug objects are on the way.
+*Settings → Radio* exposes the radio **callsign**, **DMR ID**, and the **boot
+screen** (two text lines + Picture/Text type) — all read/write. More
+general-settings fields and the DMR-ID database are on the way.
 
 ## How it works
 

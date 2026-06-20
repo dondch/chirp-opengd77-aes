@@ -31,11 +31,16 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   (Group/Private/All). A channel's **Contact** field is now a name **dropdown**.
 * **RX-group lists** (read) — a channel's **RX group list** field is a name
   dropdown. (RX-group membership editing to follow.)
+* **DTMF contacts** (read/write) — Settings → DTMF Contacts (name + code,
+  digits 0-9 A-D * #).
+* **Boot screen** (read/write) — boot text line 1 / line 2 and the boot screen
+  type (Picture/Text), in Settings → Radio.
 * **Host tests, no hardware** — fake-radio fixture + AES codec round-trip,
   sibling-block preservation, BCD helpers, channel encode/decode round-trips,
   diff-only sector writes, unmanaged-byte preservation, general-settings
   round-trip, zone create/membership/rename/multi-zone, contact read/create,
-  RX-group read, channel contact/TG dropdowns. `python run_tests.py` → 26 passed.
+  RX-group read, channel contact/TG dropdowns, DTMF read/create, boot text.
+  `python run_tests.py` → 29 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -75,6 +80,10 @@ groups (`Brandmeister`, `DMR MARC`) — names, BCD numbers and call types all
 correct; channel 1's Contact dropdown correctly resolved to `6: DCH_Group`.
 (Read-only check; contact write uses the same proven flash path + host tests.) ✔
 
+**DTMF + boot (2026-06-21, COM4):** boot text read as `Radioddity` / `GD-77`,
+screen type `Text`; 0 DTMF contacts on the radio (none programmed). DTMF/boot
+write use the same proven flash path + host tests. ✔
+
 ## Write mechanism — solved
 
 The earlier channel-write blocker is resolved. On MD-UV380/390 the "EEPROM"
@@ -89,11 +98,10 @@ is no write-path blocker.
 
 1. **RX-group membership editing** (read + channel dropdown done; editing the
    group's contact list pending).
-2. **DTMF contacts** (32 B, 63 max) — raw `0x2F88`.
-3. **General settings** — callsign + DMR ID done; remaining fields (boot text
-   `0x7540`/`0x7550`, monitor/VOX/timer toggles) pending.
-4. **DMR-ID database** (raw flash `0x30000`).
-5. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
+2. **General settings** — callsign, DMR ID and boot screen done; misc toggles
+   (monitor/VOX/timers, the flag bytes at `0x00FA`-`0x00FD`) pending.
+3. **DMR-ID database** (raw flash `0x30000`) — large callsign-lookup table.
+4. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
    only a *from-source frozen rebuild* would also need the module added to
    `chirp/drivers/__init__.py:__all__` (not required for Load Module).
 
