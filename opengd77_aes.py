@@ -114,6 +114,15 @@ _RANGES = [
     (IMG_FLASH_CH, AREA_FLASH, FLASH_CH_BITMAP_ADDR, FLASH_CH_LEN),
 ]
 
+# Writable spans: (image_offset, raw_flash_addr, length).  All written through
+# the flash 'X' protocol (EEPROM region included -- it is flash at offset 0).
+# The EEPROM bank-0 bitmap (0x3780) + 128 channels (0x3790) are contiguous.
+_WRITE_SPANS = [
+    (IMG_AES, CUSTOM_DATA_ADDR, SECTOR_SIZE),
+    (IMG_EE_BITMAP, EE_CH_BITMAP_ADDR, 16 + CH_PER_BANK * CH_SIZE),
+    (IMG_FLASH_CH, FLASH_CH_BITMAP_ADDR, FLASH_CH_LEN),
+]
+
 HEX = "0123456789abcdefABCDEF"
 
 
@@ -149,6 +158,11 @@ def _decode_name(raw):
             break
         out.append(b)
     return bytes(out).decode("ascii", "replace").rstrip()
+
+
+def _encode_name(name, length=16):
+    b = name.encode("ascii", "ignore")[:length]
+    return b + b"\xFF" * (length - len(b))
 
 
 # --------------------------------------------------------------------------
@@ -301,10 +315,7 @@ def _read_area(pipe, area, addr, length):
     return out
 
 
-def _write_flash_sector(pipe, addr, data):
-    """CPS 'X' prepare/send/commit.  Writes @data at raw flash @addr; the rest
-    of the 4 KB sector is preserved by the firmware."""
-    sector = addr // SECTOR_SIZE
+def _flash_prepare(pipe, sector):
     req = bytes([ord("X"), 1,
                  (sector >> 16) & 0xFF, (sector >> 8) & 0xFF, sector & 0xFF])
     pipe.reset_input_buffer()
@@ -313,8 +324,11 @@ def _write_flash_sector(pipe, addr, data):
     time.sleep(0.2)
     r = pipe.read(8)
     if not r or r[0] == ord("-"):
-        raise errors.RadioError("Flash prepare-sector failed (%r)" % r)
+        raise errors.RadioError("Flash prepare-sector 0x%X failed (%r)" % (
+            sector, r))
 
+
+def _flash_send(pipe, addr, data):
     off = 0
     while off < len(data):
         chunk = data[off:off + 1024]
@@ -332,6 +346,8 @@ def _write_flash_sector(pipe, addr, data):
             raise errors.RadioError("Flash send-data failed @0x%X (%r)" % (a, r))
         off += len(chunk)
 
+
+def _flash_commit(pipe):
     pipe.reset_input_buffer()
     pipe.write(bytes([ord("X"), 3]))
     pipe.flush()
@@ -339,6 +355,42 @@ def _write_flash_sector(pipe, addr, data):
     r = pipe.read(8)
     if not r or r[0] == ord("-"):
         raise errors.RadioError("Flash commit failed (%r)" % r)
+
+
+def _write_region(pipe, raw_addr, new_data, old_data=None):
+    """Write @new_data to raw SPI-flash @raw_addr, one 4 KB sector at a time.
+
+    Only this region's bytes are sent; the firmware preserves the rest of each
+    touched sector (it reads the sector, patches, erases, writes back).  This is
+    how EEPROM-resident codeplug data is written on MD-UV380 (EEPROM == SPI
+    flash at offset 0; the dedicated EEPROM write command is a no-op there).
+
+    If @old_data is given, sectors whose region-bytes are unchanged are skipped.
+    Each written sector is verified by read-back.  Returns the number of sectors
+    written.
+    """
+    n = len(new_data)
+    end = raw_addr + n
+    sector = raw_addr // SECTOR_SIZE
+    written = 0
+    while sector * SECTOR_SIZE < end:
+        s0 = sector * SECTOR_SIZE
+        s1 = s0 + SECTOR_SIZE
+        seg0 = max(raw_addr, s0)
+        seg1 = min(end, s1)
+        i0 = seg0 - raw_addr
+        i1 = seg1 - raw_addr
+        seg = bytes(new_data[i0:i1])
+        if old_data is None or bytes(old_data[i0:i1]) != seg:
+            _flash_prepare(pipe, sector)
+            _flash_send(pipe, seg0, seg)
+            _flash_commit(pipe)
+            rb = _read_area(pipe, AREA_FLASH, seg0, len(seg))
+            if rb != seg:
+                raise errors.RadioError("Write verify failed @0x%X" % seg0)
+            written += 1
+        sector += 1
+    return written
 
 
 def _read_radio_info(pipe):
@@ -376,10 +428,10 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
     def get_prompts(cls):
         rp = chirp_common.RadioPrompts()
         rp.experimental = (
-            "This driver targets the OpenGD77-AES256 firmware.  Its purpose is "
-            "AES-256 key management (Settings -> AES Keys), which is fully "
-            "supported (read/edit/write).  Channels are shown READ-ONLY in this "
-            "build; channel and other codeplug editing are in development.\n\n"
+            "This driver targets the OpenGD77-AES256 firmware.  Supported: "
+            "AES-256 key management (Settings -> AES Keys) and channel "
+            "read/write (memories 1-1024, analog + DMR).  Zones, contacts, RX "
+            "groups and other codeplug objects are still in development.\n\n"
             "AES voice encryption is only legal on licensed commercial / PMR "
             "allocations -- NOT on amateur (ham) bands.")
         rp.pre_download = (
@@ -387,8 +439,9 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             "2. The radio should be on (normal mode).\n"
             "3. Click OK to download.")
         rp.pre_upload = (
-            "Upload writes ONLY the AES key store in this build.  Channels and "
-            "other codeplug data are not written back yet.")
+            "Upload writes the AES key store and channels (only changed flash "
+            "sectors are written).  Zones, contacts and other objects are not "
+            "written back yet.")
         return rp
 
     def get_features(self):
@@ -461,6 +514,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         finally:
             _close_cps(pipe)
         self._mmap = memmap.MemoryMapBytes(bytes(image))
+        self._orig = bytes(image)        # for change-detection on upload
         self.process_mmap()
 
     def _do_upload(self):
@@ -474,13 +528,19 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 raise errors.RadioError(
                     "Connected radio is not an MD-UV380/390 (radioType=%d)" %
                     info["radio_type"])
-            # This build writes ONLY the AES custom-data sector.
-            sector = bytes(self._mmap.get_packed()[IMG_AES:IMG_AES + SECTOR_SIZE])
-            _write_flash_sector(pipe, CUSTOM_DATA_ADDR, sector)
-            readback = _read_area(pipe, AREA_FLASH, CUSTOM_DATA_ADDR, SECTOR_SIZE)
-            if readback != sector:
-                raise errors.RadioError(
-                    "AES key store read-back verify failed")
+            img = self._mmap.get_packed()
+            orig = getattr(self, "_orig", None)
+            status = chirp_common.Status()
+            status.msg = "Writing codeplug"
+            status.max = len(_WRITE_SPANS)
+            total = 0
+            for i, (img_off, raw_addr, length) in enumerate(_WRITE_SPANS):
+                new = img[img_off:img_off + length]
+                old = orig[img_off:img_off + length] if orig else None
+                total += _write_region(pipe, raw_addr, new, old)
+                status.cur = i + 1
+                self.status_fn(status)
+            LOG.info("upload wrote %d sector(s)", total)
         finally:
             _close_cps(pipe)
 
@@ -564,13 +624,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         if (flag4 & 0x20) or (flag4 & 0x10):   # ZONE_SKIP / ALL_SKIP
             mem.skip = "S"
 
-        if ch_mode == 1:
-            self._add_dmr_extras(mem, raw)
-
-        # Read-only in this build: lock all fields in the editor.
-        mem.immutable = ["freq", "name", "mode", "duplex", "offset",
-                         "tmode", "rtone", "ctone", "dtcs", "rx_dtcs",
-                         "power", "skip"]
+        self._add_dmr_extras(mem, raw)
         return mem
 
     @staticmethod
@@ -606,7 +660,11 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         cc = raw[44] & 0x0F
         ts = 2 if (raw[49] & 0x40) else 1
         contact = struct.unpack_from("<H", raw, 46)[0]
+        if contact > 1024:                  # 0xFFFF / unset -> show "none"
+            contact = 0
         tg_list = raw[43]
+        if tg_list > 76:                    # 0xFF / unset -> show "none"
+            tg_list = 0
         group.append(RadioSetting(
             "cc", "Colour code",
             RadioSettingValueInteger(0, 15, cc)))
@@ -623,15 +681,99 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             group.append(RadioSetting(
                 "encrypt", "Privacy / AES key selector (encrypt byte)",
                 RadioSettingValueInteger(0, 255, raw[41])))
-        for s in group:
-            s.set_doc("Read-only in this build")
         mem.extra = group
 
-    def set_memory(self, memory):
-        raise errors.InvalidValueError(
-            "Channel editing is not supported in this build. AES key "
-            "management (Settings -> AES Keys) is fully supported; channel "
-            "write is coming in a future release.")
+    def set_memory(self, mem):
+        img = bytearray(self._mmap.get_packed())
+        off, bm, bit = self._channel_offset(mem.number)
+
+        if mem.empty:
+            img[bm] &= ~(1 << bit)
+            img[off:off + CH_SIZE] = b"\xFF" * CH_SIZE
+            self._mmap = memmap.MemoryMapBytes(bytes(img))
+            return
+
+        in_use = bool((img[bm] >> bit) & 0x01)
+        # Modify the existing record in place (preserve OpenGD77-specific fields
+        # CHIRP doesn't expose); start from a zeroed template for a new channel.
+        raw = bytearray(img[off:off + CH_SIZE]) if in_use else bytearray(CH_SIZE)
+
+        raw[0:16] = _encode_name(mem.name)
+
+        struct.pack_into("<I", raw, 16, _int2bcd(mem.freq // 10))
+        if mem.duplex == "-":
+            tx = mem.freq - mem.offset
+        elif mem.duplex == "+":
+            tx = mem.freq + mem.offset
+        else:                                    # "" or "off"
+            tx = mem.freq
+        struct.pack_into("<I", raw, 20, _int2bcd(tx // 10))
+
+        raw[24] = 1 if mem.mode == "DMR" else 0
+
+        tx_css, rx_css = self._encode_tones(mem)
+        struct.pack_into("<H", raw, 32, rx_css)
+        struct.pack_into("<H", raw, 34, tx_css)
+
+        f4 = raw[51]
+        if mem.power in self.POWER_LEVELS:
+            high = self.POWER_LEVELS.index(mem.power) == 0
+        else:
+            high = True
+        f4 = (f4 | 0x80) if high else (f4 & ~0x80)
+        if mem.mode == "FM":
+            f4 |= 0x02                           # 25 kHz
+        else:
+            f4 &= ~0x02                          # NFM / DMR -> 12.5 kHz
+        if mem.duplex == "off":
+            f4 |= 0x04                           # RX only
+        else:
+            f4 &= ~0x04
+        if mem.skip == "S":
+            f4 |= 0x20                           # zone skip
+        else:
+            f4 &= ~0x20
+        raw[51] = f4 & 0xFF
+
+        if mem.extra:
+            ex = {s.get_name(): s.value for s in mem.extra}
+            if "cc" in ex:
+                raw[44] = (raw[44] & 0xF0) | (int(ex["cc"]) & 0x0F)
+            if "ts" in ex:
+                raw[49] = (raw[49] | 0x40) if int(ex["ts"]) == 2 \
+                    else (raw[49] & ~0x40) & 0xFF
+            if "contact" in ex:
+                struct.pack_into("<H", raw, 46, int(ex["contact"]) & 0xFFFF)
+            if "tg_list" in ex:
+                raw[43] = int(ex["tg_list"]) & 0xFF
+            if "encrypt" in ex:
+                raw[41] = int(ex["encrypt"]) & 0xFF
+
+        img[off:off + CH_SIZE] = raw
+        img[bm] |= (1 << bit)
+        self._mmap = memmap.MemoryMapBytes(bytes(img))
+
+    @staticmethod
+    def _encode_tones(mem):
+        def css_tone(freq):
+            return _int2bcd(int(round(freq * 10)))
+
+        def css_dtcs(code, pol):
+            v = _int2bcd(code) | 0x8000
+            if pol == "R":
+                v |= 0x4000
+            return v
+
+        tx = rx = CSS_NONE
+        if mem.tmode == "Tone":
+            tx = css_tone(mem.rtone)
+        elif mem.tmode == "TSQL":
+            tx = rx = css_tone(mem.ctone)
+        elif mem.tmode == "DTCS":
+            pol = mem.dtcs_polarity or "NN"
+            tx = css_dtcs(mem.dtcs, pol[0])
+            rx = css_dtcs(mem.dtcs, pol[1])
+        return tx, rx
 
     # -- settings: AES key store ----------------------------------------
     def get_settings(self):

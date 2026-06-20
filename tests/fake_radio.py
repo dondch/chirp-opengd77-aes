@@ -20,6 +20,7 @@ class FakeOpenGD77(object):
         self._out = b""
         self._sector = -1
         self._sectorbuf = None
+        self.commits = 0          # number of committed sector writes
         # pyserial-compatible attributes the driver sets
         self.baudrate = 115200
         self.timeout = 1.0
@@ -60,7 +61,9 @@ class FakeOpenGD77(object):
         elif area == AREA_FLASH:
             payload = bytes(self.flash[addr:addr + n])
         elif area == AREA_EEPROM:
-            payload = bytes(self.eeprom[addr:addr + n])
+            # On MD-UV380 the emulated EEPROM IS the SPI flash at offset 0
+            # (EEPROM.c: EEPROM_Read -> SPI_Flash_read(addr + 0)).
+            payload = bytes(self.flash[addr:addr + n])
         else:
             self._out += b"-"
             return
@@ -86,6 +89,7 @@ class FakeOpenGD77(object):
             self.flash[base:base + SECTOR] = self._sectorbuf
             self._sector = -1
             self._sectorbuf = None
+            self.commits += 1
             self._out += bytes([ord("X"), sub])
         else:
             self._out += b"-"
