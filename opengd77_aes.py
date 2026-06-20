@@ -544,6 +544,9 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         rf.valid_tmodes = ["", "Tone", "TSQL", "DTCS"]
         rf.valid_power_levels = self.POWER_LEVELS
         rf.valid_duplexes = ["", "-", "+", "off"]
+        # OpenGD77 step table (kHz). Must include 6.25 (PMR446) and 2.5, or
+        # CHIRP rejects those frequencies as "step not supported".
+        rf.valid_tuning_steps = [2.5, 5.0, 6.25, 10.0, 12.5, 25.0, 30.0, 50.0]
         rf.valid_bands = [(136000000, 174000000), (400000000, 480000000)]
         rf.valid_characters = chirp_common.CHARSET_ASCII
         rf.valid_skips = ["", "S"]

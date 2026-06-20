@@ -59,6 +59,27 @@ def _reload(fake):
     return r
 
 
+def test_tuning_steps_include_6p25():
+    fake, radio = _fresh_radio()
+    steps = radio.get_features().valid_tuning_steps
+    # PMR446 (e.g. 446.006250) needs 6.25 kHz; 2.5 is also used by OpenGD77.
+    assert 6.25 in steps
+    assert 2.5 in steps
+
+
+def test_pmr446_channel_roundtrip():
+    fake, radio = _fresh_radio()
+    mem = chirp_common.Memory()
+    mem.number = 7
+    mem.name = "PMR07"
+    mem.freq = 446006250          # requires the 6.25 kHz step
+    mem.mode = "NFM"
+    radio.set_memory(mem)
+    radio.sync_out()
+    m2 = _reload(fake).get_memory(7)
+    assert m2.freq == 446006250
+
+
 def test_eeprom_channel_roundtrip():
     fake, radio = _fresh_radio()
     mem = chirp_common.Memory()
