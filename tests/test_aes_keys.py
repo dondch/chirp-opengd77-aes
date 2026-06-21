@@ -167,6 +167,28 @@ def test_keys_listed_by_keyid_from_1():
     assert str(flat["aes_key_1"].value) == "ab" * 32
 
 
+def test_upload_does_not_wipe_aes_without_magic():
+    # A radio with key id 1 must keep it even if we upload an image whose AES
+    # region was never populated (no custom-data magic) -- guards data loss.
+    fake = FakeOpenGD77()
+    pre = drv.AesKeyStore()
+    pre.slots[0] = drv.AesSlot(True, 1, bytes([0x42] * 32))
+    _preload_aes(fake, pre)
+    radio = drv.OpenGD77AESRadio(fake)
+    radio.sync_in()
+
+    img = bytearray(radio._mmap.get_packed())
+    img[drv.IMG_AES:drv.IMG_AES + drv.SECTOR_SIZE] = b"\xFF" * drv.SECTOR_SIZE
+    radio._mmap = drv.memmap.MemoryMapBytes(bytes(img))
+    radio._orig = None                       # force the unconditional write path
+    radio.sync_out()
+
+    region = bytes(fake.flash[drv.CUSTOM_DATA_ADDR:
+                              drv.CUSTOM_DATA_ADDR + drv.SECTOR_SIZE])
+    store = drv.AesKeyStore.from_payload(drv.find_aes_block(region)[1])
+    assert store.key_for(1) is not None      # key preserved, not wiped
+
+
 def test_bad_radio_type_rejected():
     fake = FakeOpenGD77(radio_type=0)  # GD-77, not MD-UV380
     _preload_aes(fake, drv.AesKeyStore())

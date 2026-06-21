@@ -796,6 +796,15 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             for i, (img_off, raw_addr, length) in enumerate(_WRITE_SPANS):
                 new = img[img_off:img_off + length]
                 old = orig[img_off:img_off + length] if orig else None
+                # Safety: never overwrite the custom-data/AES sector with a
+                # region that has no "OpenGD77" magic (e.g. an image that was
+                # never downloaded) -- doing so would wipe the radio's AES keys.
+                if raw_addr == CUSTOM_DATA_ADDR and new[:8] != CUSTOM_MAGIC:
+                    LOG.warning("skipping AES sector write: image has no "
+                                "custom-data magic (would erase keys)")
+                    status.cur = i + 1
+                    self.status_fn(status)
+                    continue
                 total += _write_region(pipe, raw_addr, new, old)
                 status.cur = i + 1
                 self.status_fn(status)
