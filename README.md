@@ -38,7 +38,7 @@ A module must be re-loaded each time you start CHIRP.
    MD-UV380/390 via the firmware's `RADIO_INFO` query.
 2. Open **Settings → AES Keys**. You get:
    * **TX key id (0 = encrypted TX off)** — the key id used when transmitting.
-   * **Key id 0…15** — each with an *enabled* checkbox and a **64 hex character**
+   * **Key id 1…15** — each with an *enabled* checkbox and a **64 hex character**
      (32-byte) key field.
 3. Edit keys / TX selector, then **Radio → Upload to radio**.
 

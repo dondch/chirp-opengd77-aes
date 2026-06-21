@@ -136,15 +136,35 @@ def test_settings_edit_then_upload_persists():
     radio.set_settings(settings)
     radio.sync_out()
 
-    # Read the AES block straight from the fake radio's flash.
+    # Read the AES block straight from the fake radio's flash; the key is
+    # addressed by key id 4 (not slot 4).
     region = bytes(fake.flash[drv.CUSTOM_DATA_ADDR:
                               drv.CUSTOM_DATA_ADDR + drv.SECTOR_SIZE])
     store = drv.AesKeyStore.from_payload(drv.find_aes_block(region)[1])
     assert store.tx_key_id == 5
-    assert store.slots[4].valid
-    assert store.slots[4].key == bytes.fromhex(
+    slot = store.key_for(4)
+    assert slot is not None and slot.key_id == 4
+    assert slot.key == bytes.fromhex(
         "00112233445566778899aabbccddeeff"
         "00112233445566778899aabbccddeeff")
+
+
+def test_keys_listed_by_keyid_from_1():
+    # Real radios store e.g. key id 1 in physical slot 0; it must show as
+    # "Key id 1", and key id 0 must not be listed (selectors use 0 = off).
+    fake = FakeOpenGD77()
+    st = drv.AesKeyStore()
+    st.slots[0] = drv.AesSlot(True, 1, bytes([0xAB] * 32))
+    _preload_aes(fake, st)
+    radio = drv.OpenGD77AESRadio(fake)
+    radio.sync_in()
+    flat = {}
+    for group in radio.get_settings():
+        for el in group:
+            flat[el.get_name()] = el
+    assert "aes_valid_0" not in flat
+    assert bool(flat["aes_valid_1"].value) is True
+    assert str(flat["aes_key_1"].value) == "ab" * 32
 
 
 def test_bad_radio_type_rejected():
@@ -195,8 +215,8 @@ def test_invalid_hex_key_rejected():
     for group in settings:
         for el in group:
             flat[el.get_name()] = el
-    flat["aes_valid_0"].value = True
-    flat["aes_key_0"].value = "abc"  # too short
+    flat["aes_valid_1"].value = True
+    flat["aes_key_1"].value = "abc"  # too short
     try:
         radio.set_settings(settings)
     except Exception as e:

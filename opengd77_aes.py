@@ -427,6 +427,31 @@ class AesKeyStore(object):
                 p[e + 4:e + 4 + AESK_KEY_LEN] = slot.key
         return bytes(p)
 
+    # Key-id addressed access (the meaningful identifier; a key id may live in
+    # any physical slot, matching how the firmware matches keys).
+    def key_for(self, key_id):
+        for s in self.slots:
+            if s.valid and s.key_id == key_id:
+                return s
+        return None
+
+    def set_key(self, key_id, key):
+        free = None
+        for i, s in enumerate(self.slots):
+            if s.valid and s.key_id == key_id:
+                self.slots[i] = AesSlot(True, key_id, key)
+                return
+            if free is None and not s.valid:
+                free = i
+        if free is None:
+            raise errors.RadioError("No free AES key slot")
+        self.slots[free] = AesSlot(True, key_id, key)
+
+    def clear_key(self, key_id):
+        for i, s in enumerate(self.slots):
+            if s.valid and s.key_id == key_id:
+                self.slots[i] = AesSlot(False, key_id, b"")
+
 
 def find_aes_block(region):
     """Walk the custom-data block chain.  Return (header_offset, payload_bytes)
@@ -1389,14 +1414,19 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             "aes_txkeyid", "TX key id (0 = encrypted TX off)",
             RadioSettingValueInteger(0, 15, store.tx_key_id)))
 
-        for i in range(AESK_NUM_SLOTS):
-            slot = store.slots[i]
+        # Keys are addressed by key id 1..15 (key id 0 = "off"/"inherit" in the
+        # TX and per-channel selectors), matching the channel dropdowns. Each key
+        # id is matched to its storage slot by the slot's key_id, not its
+        # position, so a radio that stores key id 1 in slot 0 still shows here as
+        # "Key id 1".
+        for k in range(1, AESK_NUM_SLOTS):
+            slot = store.key_for(k)
             aes.append(RadioSetting(
-                "aes_valid_%d" % i, "Key id %d enabled" % i,
-                RadioSettingValueBoolean(slot.valid)))
+                "aes_valid_%d" % k, "Key id %d enabled" % k,
+                RadioSettingValueBoolean(slot is not None)))
             aes.append(RadioSetting(
-                "aes_key_%d" % i, "Key id %d (64 hex)" % i,
-                RadioSettingValueString(0, 64, slot.key_hex,
+                "aes_key_%d" % k, "Key id %d (64 hex)" % k,
+                RadioSettingValueString(0, 64, slot.key_hex if slot else "",
                                         autopad=False, charset=HEX)))
         return RadioSettings(radio, contacts, rxgroups, dtmf, aes)
 
@@ -1501,28 +1531,28 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             find_aes_block(bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE]))[1])
         if "aes_txkeyid" in flat:
             store.tx_key_id = int(flat["aes_txkeyid"].value)
-        for i in range(AESK_NUM_SLOTS):
-            vkey = "aes_valid_%d" % i
-            kkey = "aes_key_%d" % i
+        for k in range(1, AESK_NUM_SLOTS):
+            vkey = "aes_valid_%d" % k
+            kkey = "aes_key_%d" % k
             if vkey not in flat and kkey not in flat:
                 continue
-            valid = bool(flat[vkey].value) if vkey in flat \
-                else store.slots[i].valid
+            cur = store.key_for(k)
+            valid = bool(flat[vkey].value) if vkey in flat else (cur is not None)
             hexstr = str(flat[kkey].value).strip() if kkey in flat \
-                else store.slots[i].key_hex
+                else (cur.key_hex if cur else "")
             if valid:
                 if len(hexstr) != 64:
                     raise errors.InvalidValueError(
                         "AES key id %d must be exactly 64 hex characters "
-                        "(got %d)" % (i, len(hexstr)))
+                        "(got %d)" % (k, len(hexstr)))
                 try:
                     key = bytes.fromhex(hexstr)
                 except ValueError:
                     raise errors.InvalidValueError(
-                        "AES key id %d is not valid hex" % i)
-                store.slots[i] = AesSlot(True, i, key)
+                        "AES key id %d is not valid hex" % k)
+                store.set_key(k, key)
             else:
-                store.slots[i] = AesSlot(False, i, b"")
+                store.clear_key(k)
         region = region_with_aes(
             bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE]), store.to_payload())
         img[IMG_AES:IMG_AES + SECTOR_SIZE] = region

@@ -7,10 +7,13 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
 * **Device detect / connect** — `RADIO_INFO` query, confirms `radioType == 6`
   (MD-UV380/390) before reading or writing.
 * **AES-256 key management (the differentiator)** — read, edit and write the
-  16-slot AES key store and the TX-key selector, via *Settings → AES Keys*.
+  AES key store and the TX-key selector, via *Settings → AES Keys*.
+  * Keys are listed/addressed by **key id 1..15** (matching the channel and
+    TX selectors; key id 0 = off/inherit), independent of the physical storage
+    slot — so a radio that stores key id 1 in slot 0 shows as "Key id 1".
   * Robust write: locates/creates the `AESK` block in the custom-data block
     chain in place, preserving sibling blocks; verifies by read-back.
-  * Validation: per-slot enable, 64-hex-char enforcement, reversed-byte-order
+  * Validation: per-key enable, 64-hex-char enforcement, reversed-byte-order
     note in the UI.
 * **Channels — read & write** (memories 1–1024, analog + DMR). Name, freq,
   duplex/offset, FM/NFM/DMR mode, CTCSS/DCS tones, per-channel **power**
