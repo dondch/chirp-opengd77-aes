@@ -142,11 +142,16 @@ BOOT_LINES_ADDR = 0x7540                                # line1[16] @0x7540, lin
 BOOT_LINES_LEN = 32
 BOOT_INTRO_ADDR = 0x7518                                # 0x01 = text, 0x00 = picture
 
-# DMR-ID database header (read-only status only). The DB itself is a large,
-# sorted, compressed, multi-area bulk table managed by the OpenGD77 CPS
-# downloader -- not edited here.  Header: "Id" magic, count at bytes 8..11.
+# DMR-ID database (caller-ID lookup). Header at 0x50000: "Id" magic, byte[2]
+# selects ID size (not 'N'/'n' -> 4-byte BCD ids + plain text), byte[3] =
+# record length + 0x4A, count at bytes 8..11. Records are sorted ascending by
+# id (the firmware binary-searches). This driver writes the simple 4-byte-BCD +
+# plain-text format into area 1 only (0x50000..0x90000, before the codeplug).
 DMRID_HEADER_ADDR = FLASH_OFFSET + 0x30000             # 0x50000
 DMRID_HEADER_LEN = 12
+DMRID_CONTACT_LEN = 24                                  # 4-byte id + 20-byte text
+DMRID_AREA1_BYTES = 0x40000 - DMRID_HEADER_LEN
+DMRID_MAX_ENTRIES = DMRID_AREA1_BYTES // DMRID_CONTACT_LEN
 
 CSS_NONE = 0xFFFF
 
@@ -242,6 +247,87 @@ def _decode_name(raw):
 def _encode_name(name, length=16):
     b = name.encode("ascii", "ignore")[:length]
     return b + b"\xFF" * (length - len(b))
+
+
+# --------------------------------------------------------------------------
+# DMR-ID database importer (radioid.net-style CSV -> on-flash DB blob).
+# Pure functions, no radio/CHIRP dependency.
+# --------------------------------------------------------------------------
+def parse_dmrid_csv(data):
+    """Parse a radioid.net-style user CSV into [(id:int, text:str), ...].
+
+    Accepts a header row (maps RADIO_ID/ID, CALLSIGN, FIRST_NAME/NAME columns)
+    or headerless rows assumed to be id, callsign, name, ...  text becomes
+    "CALLSIGN Firstname".
+    """
+    import csv
+    import io
+
+    rows = list(csv.reader(io.StringIO(data)))
+    if not rows:
+        return []
+
+    id_i, call_i, name_i, start = 0, 1, 2, 0
+    first = rows[0]
+    if first and not first[0].strip().isdigit():
+        hdr = [c.strip().lower() for c in first]
+
+        def find(names, default):
+            for n in names:
+                if n in hdr:
+                    return hdr.index(n)
+            return default
+
+        id_i = find(["radio_id", "id", "dmr_id"], 0)
+        call_i = find(["callsign", "call"], 1)
+        name_i = find(["first_name", "fname", "name"], None)
+        start = 1
+
+    out = []
+    for row in rows[start:]:
+        if len(row) <= id_i:
+            continue
+        idc = row[id_i].strip()
+        if not idc.isdigit():
+            continue
+        call = row[call_i].strip() if (call_i is not None and
+                                       len(row) > call_i) else ""
+        nm = row[name_i].strip() if (name_i is not None and
+                                     len(row) > name_i) else ""
+        text = ("%s %s" % (call, nm)).strip() if nm else call
+        out.append((int(idc), text or idc))
+    return out
+
+
+def build_dmrid_db(records, contact_len=DMRID_CONTACT_LEN):
+    """Build the on-flash DMR-ID DB blob (4-byte BCD id + plain text).
+
+    Records are sorted ascending by id and de-duplicated; the list is capped to
+    what fits in area 1.  Returns (blob, num_entries, truncated)."""
+    text_len = contact_len - 4
+    seen = set()
+    recs = []
+    for rid, text in sorted(records, key=lambda r: r[0]):
+        if rid in seen:
+            continue
+        seen.add(rid)
+        recs.append((rid, text))
+
+    truncated = len(recs) > DMRID_MAX_ENTRIES
+    recs = recs[:DMRID_MAX_ENTRIES]
+
+    body = bytearray()
+    for rid, text in recs:
+        body += struct.pack("<I", _int2bcd(rid))
+        tb = text.encode("ascii", "ignore")[:text_len]
+        body += tb + b"\x00" * (text_len - len(tb))
+
+    header = bytearray(DMRID_HEADER_LEN)
+    header[0:2] = b"Id"
+    header[2] = 0x00                         # 4-byte BCD ids (not 'N'/'n')
+    header[3] = (0x4A + contact_len) & 0xFF
+    struct.pack_into("<I", header, 8, len(recs))
+    return bytes(header) + bytes(body), len(recs), truncated
 
 
 # --------------------------------------------------------------------------
@@ -436,7 +522,7 @@ def _flash_commit(pipe):
         raise errors.RadioError("Flash commit failed (%r)" % r)
 
 
-def _write_region(pipe, raw_addr, new_data, old_data=None):
+def _write_region(pipe, raw_addr, new_data, old_data=None, progress=None):
     """Write @new_data to raw SPI-flash @raw_addr, one 4 KB sector at a time.
 
     Only this region's bytes are sent; the firmware preserves the rest of each
@@ -445,13 +531,15 @@ def _write_region(pipe, raw_addr, new_data, old_data=None):
     flash at offset 0; the dedicated EEPROM write command is a no-op there).
 
     If @old_data is given, sectors whose region-bytes are unchanged are skipped.
-    Each written sector is verified by read-back.  Returns the number of sectors
-    written.
+    Each written sector is verified by read-back.  @progress(done, total) is
+    called per sector.  Returns the number of sectors written.
     """
     n = len(new_data)
     end = raw_addr + n
-    sector = raw_addr // SECTOR_SIZE
-    written = 0
+    first = raw_addr // SECTOR_SIZE
+    total = ((end - 1) // SECTOR_SIZE) - first + 1
+    sector = first
+    written = done = 0
     while sector * SECTOR_SIZE < end:
         s0 = sector * SECTOR_SIZE
         s1 = s0 + SECTOR_SIZE
@@ -468,6 +556,9 @@ def _write_region(pipe, raw_addr, new_data, old_data=None):
             if rb != seg:
                 raise errors.RadioError("Write verify failed @0x%X" % seg0)
             written += 1
+        done += 1
+        if progress:
+            progress(done, total)
         sector += 1
     return written
 
@@ -510,9 +601,8 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             "This driver targets the OpenGD77-AES256 firmware.  Supported: "
             "AES-256 key management (Settings -> AES Keys), channel read/write "
             "(memories 1-1024, analog + DMR), zones (as banks), digital + DTMF "
-            "contacts, RX groups, and radio settings (callsign, DMR ID, boot "
-            "screen).  The DMR-ID database shows a read-only status; bulk "
-            "import is left to the OpenGD77 CPS.\n\n"
+            "contacts, RX groups, radio settings (callsign, DMR ID, boot "
+            "screen) and DMR-ID database import from a CSV (Settings -> Radio).\n\n"
             "AES voice encryption is only legal on licensed commercial / PMR "
             "allocations -- NOT on amateur (ham) bands.")
         rp.pre_download = (
@@ -626,8 +716,39 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 status.cur = i + 1
                 self.status_fn(status)
             LOG.info("upload wrote %d sector(s)", total)
+            self._maybe_import_dmrid(pipe)
         finally:
             _close_cps(pipe)
+
+    def _maybe_import_dmrid(self, pipe):
+        path = getattr(self, "_dmrid_import_path", None)
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                data = fh.read()
+        except OSError as e:
+            raise errors.RadioError("Cannot read DMR-ID CSV %r: %s" % (path, e))
+        records = parse_dmrid_csv(data)
+        if not records:
+            raise errors.RadioError("No usable rows in DMR-ID CSV %r" % path)
+        blob, n, truncated = build_dmrid_db(records)
+        status = chirp_common.Status()
+        status.msg = "Writing DMR-ID database (%d entries)" % n
+
+        def prog(done, tot):
+            status.max = tot
+            status.cur = done
+            self.status_fn(status)
+
+        _write_region(pipe, DMRID_HEADER_ADDR, blob, progress=prog)
+        # Reflect the new header in the image so the status field updates.
+        img = bytearray(self._img())
+        img[IMG_DMRIDHDR:IMG_DMRIDHDR + DMRID_HEADER_LEN] = blob[:DMRID_HEADER_LEN]
+        self._mmap = memmap.MemoryMapBytes(bytes(img))
+        self._dmrid_import_path = None
+        LOG.info("DMR-ID DB import: wrote %d entries%s", n,
+                 " (CSV truncated to fit)" if truncated else "")
 
     def process_mmap(self):
         # Channels are parsed on demand in get_memory(); precompute the contact
@@ -1078,9 +1199,18 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             db = "not loaded (use the OpenGD77 CPS downloader)"
         dbset = RadioSetting("dmrid_db", "DMR-ID database (read-only)",
                              RadioSettingValueString(0, 50, db, autopad=False))
-        dbset.set_doc("Informational. The DMR-ID database is a bulk download "
-                      "managed by the OpenGD77 CPS; this field is not written.")
+        dbset.set_doc("Informational. Use the import field below to write it.")
         radio.append(dbset)
+
+        imp = RadioSetting(
+            "dmrid_import",
+            "Import DMR-ID DB from CSV (path; written on Upload)",
+            RadioSettingValueString(0, 255, "", autopad=False))
+        imp.set_doc("Path to a radioid.net-style CSV (id, callsign, name). On the "
+                    "next Upload the DMR-ID database is built and written to the "
+                    "radio (up to %d entries; pre-filter larger lists). Reboot "
+                    "the radio afterwards to load it." % DMRID_MAX_ENTRIES)
+        radio.append(imp)
         return radio
 
     def _get_rxgroup_settings(self):
@@ -1206,6 +1336,10 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 str(flat["boot_line2"].value), 16)
         if "boot_screen" in flat:
             img[IMG_BOOTTYPE] = 1 if str(flat["boot_screen"].value) == "Text" else 0
+        if "dmrid_import" in flat:
+            p = str(flat["dmrid_import"].value).strip()
+            if p:
+                self._dmrid_import_path = p
 
         # -- DTMF contacts --
         for i in range(1, DTMF_MAX + 1):

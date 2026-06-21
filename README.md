@@ -80,9 +80,15 @@ described above.
 *Settings → DTMF Contacts* manages DTMF contacts (name + a code of 0-9, A-D,
 \* and #).
 
-The **DMR-ID database** (caller-ID lookup) appears read-only in *Settings →
-Radio* as an entry count. It's a bulk download best managed with the OpenGD77
-CPS; this driver shows its status but does not write it.
+## DMR-ID database
+
+The **DMR-ID database** (caller-ID lookup) can be imported from a
+radioid.net-style CSV: in *Settings → Radio*, set **Import DMR-ID DB from CSV**
+to the file path and click **Upload**. The driver builds the radio's DB format
+(4-byte BCD id + plain text, sorted by id) and writes it to flash. Up to ~10,900
+entries fit, so **pre-filter** large exports (e.g. by country/region); reboot
+the radio afterwards to load it. The same panel shows the current entry count.
+For very large databases, the OpenGD77 CPS downloader is still an option.
 
 ## General settings
 

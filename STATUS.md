@@ -36,15 +36,18 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   digits 0-9 A-D * #).
 * **Boot screen** (read/write) — boot text line 1 / line 2 and the boot screen
   type (Picture/Text), in Settings → Radio.
-* **DMR-ID database** — read-only status (entry count) in Settings → Radio. The
-  database is a bulk download managed by the OpenGD77 CPS; not written here.
+* **DMR-ID database (caller-ID lookup)** — import from a radioid.net-style CSV:
+  Settings → Radio, set the CSV path, then Upload. Builds the firmware's
+  4-byte-BCD + plain-text DB (sorted by id), writes it to flash area 1
+  (`0x50000`), and shows the entry count. Up to ~10.9k entries (pre-filter
+  larger lists); reboot the radio to load it.
 * **Host tests, no hardware** — fake-radio fixture + AES codec round-trip,
   sibling-block preservation, BCD helpers, channel encode/decode round-trips,
   diff-only sector writes, unmanaged-byte preservation, general-settings
   round-trip, zone create/membership/rename/multi-zone, contact read/create,
   RX-group read/edit, channel contact/TG dropdowns, DTMF read/create, boot text,
-  DMR-ID DB status, bank-count limit + membership cache. `python run_tests.py`
-  → 34 passed.
+  DMR-ID DB status, bank-count limit + membership cache, tuning steps, DMR-ID
+  CSV import (parse/build/upload). `python run_tests.py` → 41 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -93,6 +96,11 @@ write use the same proven flash path + host tests. ✔
 free slot, read back, restored the RX-group sectors byte-exact. DMR-ID DB status
 read as "not loaded" (the radio has no DB downloaded). ✔
 
+**DMR-ID DB import (2026-06-21, COM4):** imported a 3-entry CSV, wrote the DB to
+`0x50000`, read it back (`Id` magic, count 3), firmware-style lookups resolved
+`2342001 → G4ABC John` and `3101234 → W1AW Hiram`, then restored the DB sector
+byte-exact. ✔
+
 ## Write mechanism — solved
 
 The earlier channel-write blocker is resolved. On MD-UV380/390 the "EEPROM"
@@ -107,10 +115,9 @@ is no write-path blocker.
 
 1. **General settings** — callsign, DMR ID, boot screen done; misc toggles
    (monitor/VOX/timers, the flag bytes at `0x00FA`-`0x00FD`) pending.
-2. **DMR-ID database bulk import** (status read-only today). A CSV/`radioid.net`
-   importer that builds the sorted, 6-bit-compressed, two-area DB and writes
-   ~256 KB would replicate the CPS downloader — large; currently out of scope
-   (use the OpenGD77 CPS for this).
+2. **Larger DMR-ID databases** — area 1 (~10.9k entries) is supported via CSV
+   import. Going beyond needs the 3-byte-id + 6-bit-compressed format and area 2
+   (`0xD8000`); for very large DBs use the OpenGD77 CPS downloader.
 3. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
    only a *from-source frozen rebuild* would also need the module added to
    `chirp/drivers/__init__.py:__all__` (not required for Load Module).
