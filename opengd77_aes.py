@@ -249,6 +249,26 @@ def _encode_name(name, length=16):
     return b + b"\xFF" * (length - len(b))
 
 
+def _channel_optional_dmrid(raw):
+    """Per-channel optional DMR ID (0 if disabled).  When flag1 bit7 is set,
+    bytes 39..41 hold a 24-bit binary id (overlapping rxSignaling/arts/encrypt)."""
+    if raw[38] & 0x80:
+        return (raw[39] << 16) | (raw[40] << 8) | raw[41]
+    return 0
+
+
+def _channel_set_optional_dmrid(raw, dmrid):
+    if 0 < dmrid <= 0xFFFFFF:
+        raw[38] |= 0x80
+        raw[39] = (dmrid >> 16) & 0xFF
+        raw[40] = (dmrid >> 8) & 0xFF
+        raw[41] = dmrid & 0xFF
+    elif raw[38] & 0x80:                  # was enabled, now turned off -> reset
+        raw[38] = raw[38] & ~0x80 & 0xFF
+        raw[39], raw[40], raw[41] = 0x00, 0x16, 0x00
+    # else: already off -> leave rxSignaling/artsInterval/encrypt untouched
+
+
 # --------------------------------------------------------------------------
 # DMR-ID database importer (radioid.net-style CSV -> on-flash DB blob).
 # Pure functions, no radio/CHIRP dependency.
@@ -589,9 +609,21 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
     FORMATS = []
     _memsize = IMAGE_SIZE
 
+    # OpenGD77 per-channel power (libreDMR_Power byte): 0 = Master (use the
+    # radio's global power), else level = value - 1.  List index == the stored
+    # byte value.  Watts match the MD-UV390 10W-Plus power table.
     POWER_LEVELS = [
-        chirp_common.PowerLevel("High", watts=10.0),
-        chirp_common.PowerLevel("Low", watts=1.0),
+        chirp_common.PowerLevel("Master", watts=0.0),
+        chirp_common.PowerLevel("50mW", watts=0.05),
+        chirp_common.PowerLevel("250mW", watts=0.25),
+        chirp_common.PowerLevel("500mW", watts=0.5),
+        chirp_common.PowerLevel("750mW", watts=0.75),
+        chirp_common.PowerLevel("1W", watts=1.0),
+        chirp_common.PowerLevel("2W", watts=2.0),
+        chirp_common.PowerLevel("3W", watts=3.0),
+        chirp_common.PowerLevel("5W", watts=5.0),
+        chirp_common.PowerLevel("10W", watts=10.0),
+        chirp_common.PowerLevel("Max", watts=11.0),
     ]
 
     @classmethod
@@ -837,10 +869,11 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         tx_tone = struct.unpack_from("<H", raw, 34)[0]
         self._decode_tones(mem, tx_tone, rx_tone)
 
-        mem.power = self.POWER_LEVELS[0 if (flag4 & 0x80) else 1]
+        lp = raw[25]                           # libreDMR_Power (0 = Master)
+        mem.power = self.POWER_LEVELS[lp if lp < len(self.POWER_LEVELS) else 0]
         if flag4 & 0x04:                       # RX_ONLY
             mem.duplex = "off"
-        if (flag4 & 0x20) or (flag4 & 0x10):   # ZONE_SKIP / ALL_SKIP
+        if flag4 & 0x20:                       # ZONE_SKIP
             mem.skip = "S"
 
         self._add_dmr_extras(mem, raw)
@@ -886,13 +919,25 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return options, current
 
     def _add_dmr_extras(self, mem, raw):
-        group = RadioSettingGroup("dmr", "DMR")
-        optional_dmrid = bool(raw[38] & 0x80)
+        group = RadioSettingGroup("opengd77", "OpenGD77")
+        flag4 = raw[51]
         group.append(RadioSetting(
-            "cc", "Colour code",
+            "tot", "Time-out timer (s, 0=off)",
+            RadioSettingValueInteger(0, 255 * 15, raw[27] * 15, 15)))
+        group.append(RadioSetting(
+            "vox", "VOX", RadioSettingValueBoolean(bool(flag4 & 0x40))))
+        group.append(RadioSetting(
+            "squelch", "Squelch (0=master, 1-21)",
+            RadioSettingValueInteger(0, 21, raw[55] if raw[55] <= 21 else 0)))
+        group.append(RadioSetting(
+            "all_skip", "Skip on all-scan (lone worker)",
+            RadioSettingValueBoolean(bool(flag4 & 0x10))))
+
+        group.append(RadioSetting(
+            "cc", "DMR colour code",
             RadioSettingValueInteger(0, 15, raw[44] & 0x0F)))
         group.append(RadioSetting(
-            "ts", "Timeslot",
+            "ts", "DMR timeslot",
             RadioSettingValueInteger(1, 2, 2 if (raw[49] & 0x40) else 1)))
 
         opts, cur = self._index_list(getattr(self, "_contacts", []),
@@ -904,10 +949,10 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         group.append(RadioSetting("tg_list", "RX group list",
                                   RadioSettingValueList(opts, cur)))
 
-        if not optional_dmrid:
-            group.append(RadioSetting(
-                "encrypt", "Privacy / AES key selector (encrypt byte)",
-                RadioSettingValueInteger(0, 255, raw[41])))
+        group.append(RadioSetting(
+            "dmrid", "Per-channel DMR ID (0=off)",
+            RadioSettingValueInteger(0, 16777215,
+                                     _channel_optional_dmrid(raw))))
         mem.extra = group
 
     def set_memory(self, mem):
@@ -942,28 +987,30 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         struct.pack_into("<H", raw, 32, rx_css)
         struct.pack_into("<H", raw, 34, tx_css)
 
+        raw[25] = (self.POWER_LEVELS.index(mem.power)   # libreDMR_Power
+                   if mem.power in self.POWER_LEVELS else 0)
+
         f4 = raw[51]
-        if mem.power in self.POWER_LEVELS:
-            high = self.POWER_LEVELS.index(mem.power) == 0
-        else:
-            high = True
-        f4 = (f4 | 0x80) if high else (f4 & ~0x80)
         if mem.mode == "FM":
             f4 |= 0x02                           # 25 kHz
         else:
             f4 &= ~0x02                          # NFM / DMR -> 12.5 kHz
-        if mem.duplex == "off":
-            f4 |= 0x04                           # RX only
-        else:
-            f4 &= ~0x04
-        if mem.skip == "S":
-            f4 |= 0x20                           # zone skip
-        else:
-            f4 &= ~0x20
+        f4 = (f4 | 0x04) if mem.duplex == "off" else (f4 & ~0x04)  # RX only
+        f4 = (f4 | 0x20) if mem.skip == "S" else (f4 & ~0x20)      # zone skip
         raw[51] = f4 & 0xFF
 
         if mem.extra:
             ex = {s.get_name(): s.value for s in mem.extra}
+            if "tot" in ex:
+                raw[27] = (int(ex["tot"]) // 15) & 0xFF
+            if "vox" in ex:
+                raw[51] = (raw[51] | 0x40) if bool(ex["vox"]) \
+                    else raw[51] & ~0x40 & 0xFF
+            if "squelch" in ex:
+                raw[55] = int(ex["squelch"]) & 0xFF
+            if "all_skip" in ex:
+                raw[51] = (raw[51] | 0x10) if bool(ex["all_skip"]) \
+                    else raw[51] & ~0x10 & 0xFF
             if "cc" in ex:
                 raw[44] = (raw[44] & 0xF0) | (int(ex["cc"]) & 0x0F)
             if "ts" in ex:
@@ -974,8 +1021,8 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                                  self._parse_index(ex["contact"]) & 0xFFFF)
             if "tg_list" in ex:
                 raw[43] = self._parse_index(ex["tg_list"]) & 0xFF
-            if "encrypt" in ex:
-                raw[41] = int(ex["encrypt"]) & 0xFF
+            if "dmrid" in ex:
+                _channel_set_optional_dmrid(raw, int(ex["dmrid"]))
 
         img[off:off + CH_SIZE] = raw
         img[bm] |= (1 << bit)

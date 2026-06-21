@@ -45,11 +45,12 @@ A module must be re-loaded each time you start CHIRP.
 ## Channels
 
 Channels (memories 1–1024, analog and DMR) are read and written through the
-normal CHIRP memory editor. DMR-specific fields appear in each memory's *Extra*
-tab: colour code, timeslot, **Contact (TX talkgroup)** and **RX group list** as
-name dropdowns, and the privacy/key-selector byte. Upload writes only the flash
-sectors that actually changed, and preserves OpenGD77-specific per-channel
-fields CHIRP doesn't expose.
+normal CHIRP memory editor, including per-channel **power** (OpenGD77 levels:
+Master / 50 mW … 10 W / Max). Each memory's *Extra* tab adds time-out timer,
+VOX, squelch, all-scan skip, DMR colour code, timeslot, **Contact (TX talkgroup)**
+and **RX group list** (name dropdowns), and a per-channel DMR ID. Upload writes
+only the flash sectors that actually changed and preserves OpenGD77-specific
+per-channel fields CHIRP doesn't expose.
 
 > Digital/DTMF contacts, RX-group lists and the DMR-ID database are not written
 > yet — see [STATUS.md](STATUS.md).

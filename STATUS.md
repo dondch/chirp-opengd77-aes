@@ -13,10 +13,12 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   * Validation: per-slot enable, 64-hex-char enforcement, reversed-byte-order
     note in the UI.
 * **Channels — read & write** (memories 1–1024, analog + DMR). Name, freq,
-  duplex/offset, FM/NFM/DMR mode, CTCSS/DCS tones, power, skip, plus DMR colour
-  code / timeslot / contact / TG-list / encrypt byte (Extra tab). Upload writes
-  only the flash sectors that changed and preserves OpenGD77-specific
-  per-channel fields CHIRP doesn't expose. Covers both the EEPROM bank
+  duplex/offset, FM/NFM/DMR mode, CTCSS/DCS tones, per-channel **power**
+  (OpenGD77 `libreDMR_Power` levels: Master/50mW…10W/Max), zone-skip; Extra tab
+  adds time-out timer, VOX, squelch, all-scan skip, DMR colour code / timeslot /
+  contact (name dropdown) / RX-group (name dropdown) / per-channel DMR ID.
+  Upload writes only the flash sectors that changed and preserves
+  OpenGD77-specific bytes CHIRP doesn't expose. Covers the EEPROM bank
   (channels 1–128) and the flash banks (129–1024) — the EEPROM region is just
   SPI flash at offset 0, written via the flash protocol.
 * **General settings — callsign + DMR ID** (Settings → Radio), read/write.
@@ -47,7 +49,8 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   round-trip, zone create/membership/rename/multi-zone, contact read/create,
   RX-group read/edit, channel contact/TG dropdowns, DTMF read/create, boot text,
   DMR-ID DB status, bank-count limit + membership cache, tuning steps, DMR-ID
-  CSV import (parse/build/upload). `python run_tests.py` → 41 passed.
+  CSV import (parse/build/upload), per-channel power + extras round-trip.
+  `python run_tests.py` → 43 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -101,6 +104,11 @@ read as "not loaded" (the radio has no DB downloaded). ✔
 `2342001 → G4ABC John` and `3101234 → W1AW Hiram`, then restored the DB sector
 byte-exact. ✔
 
+**Per-channel power + extras (2026-06-21, COM4):** PMR01 read its real power
+(`1W`, via `libreDMR_Power` — the previous flag-based mapping was wrong); a test
+channel round-tripped power `5W`, TOT `120 s`, VOX on, squelch `3`, CC `5`,
+TS `2`; EEPROM channel sectors restored byte-exact. ✔
+
 ## Write mechanism — solved
 
 The earlier channel-write blocker is resolved. On MD-UV380/390 the "EEPROM"
@@ -113,8 +121,12 @@ is no write-path blocker.
 
 ## Deferred (next phases)
 
-1. **General settings** — callsign, DMR ID, boot screen done; misc toggles
-   (monitor/VOX/timers, the flag bytes at `0x00FA`-`0x00FD`) pending.
+1. **Radio-wide settings menu** — OpenGD77 keeps its operational settings in its
+   own `nonVolatileSettings` blob (`0x604B`), NOT the TYT codeplug general-
+   settings struct (which `settings.c` leaves commented-out / unused). Those are
+   normally set on the radio; editing them from here is version-sensitive and
+   not yet done. (Callsign, DMR ID and boot screen — the codeplug-resident
+   ones — are done.)
 2. **Larger DMR-ID databases** — area 1 (~10.9k entries) is supported via CSV
    import. Going beyond needs the 3-byte-id + 6-bit-compressed format and area 2
    (`0xD8000`); for very large DBs use the OpenGD77 CPS downloader.

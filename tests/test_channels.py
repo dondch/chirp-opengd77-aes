@@ -24,16 +24,21 @@ def _dmr_extra(cc=1, ts=1, contact=0, tg_list=0):
 
 
 def _extra_dict(mem):
-    # cc/ts are integers; contact/tg_list are "idx: name" dropdowns (or "None").
+    # ints, booleans, and "idx: name" dropdowns (or "None").
     d = {}
     for s in (mem.extra or []):
         v = str(s.value)
-        if ":" in v:
+        if v in ("True", "False"):
+            d[s.get_name()] = (v == "True")
+        elif ":" in v:
             d[s.get_name()] = int(v.split(":")[0])
         elif v.startswith("None"):
             d[s.get_name()] = 0
         else:
-            d[s.get_name()] = int(v)
+            try:
+                d[s.get_name()] = int(v)
+            except ValueError:
+                d[s.get_name()] = v
     return d
 
 
@@ -57,6 +62,53 @@ def _reload(fake):
     r = drv.OpenGD77AESRadio(fake)
     r.sync_in()
     return r
+
+
+def test_power_level_libredmr_roundtrip():
+    fake, radio = _fresh_radio()
+    mem = chirp_common.Memory()
+    mem.number = 8
+    mem.name = "PWR"
+    mem.freq = 145000000
+    mem.mode = "FM"
+    mem.power = radio.POWER_LEVELS[5]      # -> libreDMR_Power byte = 5
+    radio.set_memory(mem)
+    radio.sync_out()
+    m2 = _reload(fake).get_memory(8)
+    assert radio.POWER_LEVELS.index(m2.power) == 5
+
+
+def test_channel_extras_roundtrip():
+    fake, radio = _fresh_radio()
+    mem = chirp_common.Memory()
+    mem.number = 9
+    mem.name = "EX"
+    mem.freq = 438000000
+    mem.mode = "DMR"
+    radio.set_memory(mem)
+    radio.sync_out()
+
+    r = _reload(fake)
+    m = r.get_memory(9)
+    ex = {s.get_name(): s for s in m.extra}
+    ex["tot"].value = 60          # -> raw 4 (60/15)
+    ex["vox"].value = True
+    ex["squelch"].value = 5
+    ex["all_skip"].value = True
+    ex["dmrid"].value = 1234567
+    ex["cc"].value = 7
+    ex["ts"].value = 2
+    r.set_memory(m)
+    r.sync_out()
+
+    e2 = _extra_dict(_reload(fake).get_memory(9))
+    assert e2["tot"] == 60
+    assert e2["vox"] is True
+    assert e2["squelch"] == 5
+    assert e2["all_skip"] is True
+    assert e2["dmrid"] == 1234567
+    assert e2["cc"] == 7
+    assert e2["ts"] == 2
 
 
 def test_tuning_steps_include_6p25():
