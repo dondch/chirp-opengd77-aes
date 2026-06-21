@@ -257,6 +257,32 @@ def _channel_optional_dmrid(raw):
     return 0
 
 
+# Per-channel AES encryption (channel `encrypt` byte, offset 41), per the
+# OpenGD77-AES firmware: 0 = inherit the global TX key, 1..15 = AES key slot,
+# 0xFF = force off.  Only valid when the optional-DMR-ID flag is clear (they
+# share byte 41).
+ENC_OPTIONS = (["Inherit (global TX key)", "Off (no encryption)"] +
+               ["Key %d" % i for i in range(1, 16)])
+
+
+def _enc_byte_to_label(b):
+    if b == 0:
+        return ENC_OPTIONS[0]
+    if b == 0xFF:
+        return ENC_OPTIONS[1]
+    if 1 <= b <= 15:
+        return "Key %d" % b
+    return ENC_OPTIONS[0]
+
+
+def _enc_label_to_byte(s):
+    if s.startswith("Off"):
+        return 0xFF
+    if s.startswith("Key "):
+        return int(s.split()[1])
+    return 0                                  # Inherit / fallback
+
+
 def _channel_set_optional_dmrid(raw, dmrid):
     if 0 < dmrid <= 0xFFFFFF:
         raw[38] |= 0x80
@@ -633,8 +659,9 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             "This driver targets the OpenGD77-AES256 firmware.  Supported: "
             "AES-256 key management (Settings -> AES Keys), channel read/write "
             "(memories 1-1024, analog + DMR), zones (as banks), digital + DTMF "
-            "contacts, RX groups, radio settings (callsign, DMR ID, boot "
-            "screen) and DMR-ID database import from a CSV (Settings -> Radio).\n\n"
+            "contacts, RX groups, per-channel AES encryption, radio settings "
+            "(callsign, DMR ID, boot screen) and DMR-ID database import from a "
+            "CSV (Settings -> Radio).\n\n"
             "AES voice encryption is only legal on licensed commercial / PMR "
             "allocations -- NOT on amateur (ham) bands.")
         rp.pre_download = (
@@ -949,6 +976,16 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         group.append(RadioSetting("tg_list", "RX group list",
                                   RadioSettingValueList(opts, cur)))
 
+        optional_dmrid = bool(raw[38] & 0x80)
+        enc = _enc_byte_to_label(raw[41] if not optional_dmrid else 0)
+        es = RadioSetting("encrypt", "AES encryption",
+                          RadioSettingValueList(ENC_OPTIONS, enc))
+        es.set_doc("Per-channel AES key (OpenGD77-AES firmware). 'Inherit' uses "
+                   "the global TX key; 'Key N' forces AES key slot N; 'Off' "
+                   "disables encryption. Ignored if a per-channel DMR ID is set "
+                   "(they share the same byte).")
+        group.append(es)
+
         group.append(RadioSetting(
             "dmrid", "Per-channel DMR ID (0=off)",
             RadioSettingValueInteger(0, 16777215,
@@ -1021,8 +1058,16 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                                  self._parse_index(ex["contact"]) & 0xFFFF)
             if "tg_list" in ex:
                 raw[43] = self._parse_index(ex["tg_list"]) & 0xFF
-            if "dmrid" in ex:
-                _channel_set_optional_dmrid(raw, int(ex["dmrid"]))
+            # The per-channel DMR ID and the encryption byte share offset 41.
+            # A DMR ID (>0) wins; otherwise apply the encryption selector.
+            if "dmrid" in ex or "encrypt" in ex:
+                dmrid = int(ex["dmrid"]) if "dmrid" in ex else 0
+                if dmrid > 0:
+                    _channel_set_optional_dmrid(raw, dmrid)
+                else:
+                    _channel_set_optional_dmrid(raw, 0)
+                    if "encrypt" in ex:
+                        raw[41] = _enc_label_to_byte(str(ex["encrypt"]))
 
         img[off:off + CH_SIZE] = raw
         img[bm] |= (1 << bit)

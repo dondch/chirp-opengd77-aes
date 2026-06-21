@@ -48,9 +48,15 @@ Channels (memories 1–1024, analog and DMR) are read and written through the
 normal CHIRP memory editor, including per-channel **power** (OpenGD77 levels:
 Master / 50 mW … 10 W / Max). Each memory's *Extra* tab adds time-out timer,
 VOX, squelch, all-scan skip, DMR colour code, timeslot, **Contact (TX talkgroup)**
-and **RX group list** (name dropdowns), and a per-channel DMR ID. Upload writes
-only the flash sectors that actually changed and preserves OpenGD77-specific
-per-channel fields CHIRP doesn't expose.
+and **RX group list** (name dropdowns), **per-channel AES encryption** (Inherit
+global TX key / Key 1-15 / Off), and a per-channel DMR ID. Upload writes only the
+flash sectors that actually changed and preserves OpenGD77-specific per-channel
+fields CHIRP doesn't expose.
+
+> Per-channel encryption and the per-channel DMR ID share one byte in the
+> codeplug, so they're mutually exclusive — setting a DMR ID disables the
+> per-channel key. (Per-channel encryption is a new, not-yet-fully-tested
+> OpenGD77-AES firmware feature.)
 
 > Digital/DTMF contacts, RX-group lists and the DMR-ID database are not written
 > yet — see [STATUS.md](STATUS.md).

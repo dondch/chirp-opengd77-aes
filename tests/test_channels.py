@@ -111,6 +111,65 @@ def test_channel_extras_roundtrip():
     assert e2["ts"] == 2
 
 
+def _mk_dmr(radio, fake, number):
+    mem = chirp_common.Memory()
+    mem.number = number
+    mem.name = "ENC"
+    mem.freq = 438000000
+    mem.mode = "DMR"
+    radio.set_memory(mem)
+    radio.sync_out()
+
+
+def test_channel_encryption_roundtrip():
+    fake, radio = _fresh_radio()
+    _mk_dmr(radio, fake, 10)
+    r = _reload(fake)
+    m = r.get_memory(10)
+    {s.get_name(): s for s in m.extra}["encrypt"].value = "Key 3"
+    r.set_memory(m)
+    r.sync_out()
+
+    r2 = _reload(fake)
+    m2 = r2.get_memory(10)
+    e2 = {s.get_name(): str(s.value) for s in m2.extra}
+    assert e2["encrypt"] == "Key 3"
+    off, _, _ = r2._channel_offset(10)
+    assert r2._img()[off + 41] == 3            # encrypt byte = slot 3
+
+
+def test_channel_encryption_off():
+    fake, radio = _fresh_radio()
+    _mk_dmr(radio, fake, 11)
+    r = _reload(fake)
+    m = r.get_memory(11)
+    {s.get_name(): s for s in m.extra}["encrypt"].value = "Off (no encryption)"
+    r.set_memory(m)
+    r.sync_out()
+
+    r2 = _reload(fake)
+    off, _, _ = r2._channel_offset(11)
+    assert r2._img()[off + 41] == 0xFF
+    e2 = {s.get_name(): str(s.value) for s in r2.get_memory(11).extra}
+    assert e2["encrypt"].startswith("Off")
+
+
+def test_encryption_and_dmrid_mutually_exclusive():
+    fake, radio = _fresh_radio()
+    _mk_dmr(radio, fake, 12)
+    r = _reload(fake)
+    m = r.get_memory(12)
+    ex = {s.get_name(): s for s in m.extra}
+    ex["encrypt"].value = "Key 5"
+    ex["dmrid"].value = 1234567          # DMR ID wins (shares byte 41)
+    r.set_memory(m)
+    r.sync_out()
+
+    e2 = {s.get_name(): str(s.value) for s in _reload(fake).get_memory(12).extra}
+    assert int(e2["dmrid"]) == 1234567
+    assert e2["encrypt"].startswith("Inherit")   # encryption not applied
+
+
 def test_tuning_steps_include_6p25():
     fake, radio = _fresh_radio()
     steps = radio.get_features().valid_tuning_steps

@@ -16,7 +16,8 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   duplex/offset, FM/NFM/DMR mode, CTCSS/DCS tones, per-channel **power**
   (OpenGD77 `libreDMR_Power` levels: Master/50mW…10W/Max), zone-skip; Extra tab
   adds time-out timer, VOX, squelch, all-scan skip, DMR colour code / timeslot /
-  contact (name dropdown) / RX-group (name dropdown) / per-channel DMR ID.
+  contact (name dropdown) / RX-group (name dropdown) / **per-channel AES
+  encryption** (Inherit global TX key / Key 1-15 / Off) / per-channel DMR ID.
   Upload writes only the flash sectors that changed and preserves
   OpenGD77-specific bytes CHIRP doesn't expose. Covers the EEPROM bank
   (channels 1–128) and the flash banks (129–1024) — the EEPROM region is just
@@ -49,8 +50,9 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   round-trip, zone create/membership/rename/multi-zone, contact read/create,
   RX-group read/edit, channel contact/TG dropdowns, DTMF read/create, boot text,
   DMR-ID DB status, bank-count limit + membership cache, tuning steps, DMR-ID
-  CSV import (parse/build/upload), per-channel power + extras round-trip.
-  `python run_tests.py` → 43 passed.
+  CSV import (parse/build/upload), per-channel power + extras round-trip,
+  per-channel encryption (round-trip, off, DMR-ID exclusion).
+  `python run_tests.py` → 46 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -108,6 +110,10 @@ byte-exact. ✔
 (`1W`, via `libreDMR_Power` — the previous flag-based mapping was wrong); a test
 channel round-tripped power `5W`, TOT `120 s`, VOX on, squelch `3`, CC `5`,
 TS `2`; EEPROM channel sectors restored byte-exact. ✔
+
+**Per-channel encryption (2026-06-21, COM4):** wrote a channel with
+`encrypt = Key 3`; our read and the firmware's own `0x83` subcommand both
+reported `(3, 0)`. (PMR01 already uses `Key 1`.) Sectors restored byte-exact. ✔
 
 ## Write mechanism — solved
 
