@@ -167,6 +167,35 @@ def test_keys_listed_by_keyid_from_1():
     assert str(flat["aes_key_1"].value) == "ab" * 32
 
 
+def test_keyid0_stray_cleared_on_write():
+    # A stored key with key id 0 (unusable) -- e.g. left by an older buggy
+    # write -- must be cleaned up when AES settings are applied.
+    fake = FakeOpenGD77()
+    st = drv.AesKeyStore()
+    st.slots[0] = drv.AesSlot(True, 0, bytes([0x11] * 32))   # corruption
+    st.slots[1] = drv.AesSlot(True, 1, bytes([0x22] * 32))
+    _preload_aes(fake, st)
+    radio = drv.OpenGD77AESRadio(fake)
+    radio.sync_in()
+
+    settings = radio.get_settings()
+    flat = {}
+    for group in settings:
+        for el in group:
+            flat[el.get_name()] = el
+    flat["aes_valid_2"].value = True
+    flat["aes_key_2"].value = "cc" * 32
+    radio.set_settings(settings)
+    radio.sync_out()
+
+    region = bytes(fake.flash[drv.CUSTOM_DATA_ADDR:
+                              drv.CUSTOM_DATA_ADDR + drv.SECTOR_SIZE])
+    store = drv.AesKeyStore.from_payload(drv.find_aes_block(region)[1])
+    assert all(not (s.valid and s.key_id == 0) for s in store.slots)
+    assert store.key_for(1) is not None
+    assert store.key_for(2) is not None
+
+
 def test_upload_does_not_wipe_aes_without_magic():
     # A radio with key id 1 must keep it even if we upload an image whose AES
     # region was never populated (no custom-data magic) -- guards data loss.

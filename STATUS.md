@@ -25,9 +25,39 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   OpenGD77-specific bytes CHIRP doesn't expose. Covers the EEPROM bank
   (channels 1–128) and the flash banks (129–1024) — the EEPROM region is just
   SPI flash at offset 0, written via the flash protocol.
+* **VFO A/B** (read/write) — surfaced as CHIRP **special channels** (the memory
+  editor's "VFO A"/"VFO B" rows). They are two `CodeplugChannel_t` structs at
+  EEPROM `0x7590` and reuse the full channel codec (freq, mode, tones, power,
+  DMR extras); they have no editable name and can't be deleted.
+* **Quick Keys** (read/write) — Settings → Quick Keys. The OpenGD77 long-press
+  number-key (0–9) shortcuts (codeplug `0x7524`, 10 × uint16). Each key is a
+  dropdown: (empty) or a contact (dials that TG). Menu shortcuts assigned on the
+  radio are shown as `Menu shortcut 0xXXXX` and preserved byte-exact (the menu
+  function-ID tree isn't decoded). Shares flash sector 7 with boot text/VFO;
+  the per-sector RMW keeps all of it intact.
+* **Satellite (TLE) import** — Settings → Radio, set a TLE-file path (CelesTrak
+  `amateur.txt` etc.); on Upload the matching FM birds (built-in freq table: ISS,
+  SO-50, AO-91/92/27, PO-101) are encoded into the OpenGD77 `SATELLITE_TLE`
+  custom-data block (type 3, 25 × 100 B) and written into the 64 KB custom-data
+  block chain — appended, or overwritten in place. Anti-wipe guard (needs the
+  `OpenGD77` magic); preserves the AES + other blocks. Lights up the radio's
+  Satellite menu (needs a GPS fix / location for pass prediction).
 * **General settings — callsign + DMR ID** (Settings → Radio), read/write.
-  DMR ID is big-endian BCD; callsign is an 8-char padded string. (More
-  general-settings fields — boot text, toggles — to follow.)
+  DMR ID is big-endian BCD; callsign is an 8-char padded string.
+* **Radio-wide settings** (Settings → Radio settings), read/write — the OpenGD77
+  `nonVolatileSettings` blob (116 B at raw flash `0x604B`), grouped into Audio /
+  Display / Scan / DMR / Power & timers / Options sub-tabs (~50 controls):
+  TX power, TX-timeout beep, backlight mode/timeout/brightness, contrast, squelch
+  defaults, beep/mic gain, VOX, scan resume/delay/step, DMR filters/AGC,
+  private-calls, contact-display, APO, eco, keypad/autolock timers, roaming,
+  hotspot type, band limits, GPS mode (Off/On/NMEA/Log — low nibble of
+  `gpsModeAndBaudsIndex`, baud nibble preserved), time zone (UTC offset in 15-min
+  steps + UTC/Local flag, packed in the `timezone` byte), plus boolean toggles (PTT latch, inverse video,
+  TX/RX freq lock, LEDs off, scan-on-boot, TX inhibit, channels read-only,
+  auto-night, …). Patches only the bytes that changed; preserves `magicNumber`
+  (anti factory-reset guard) and all unmanaged bytes. **Takes effect after a
+  radio reboot** (settings load to RAM at boot). Excludes factory calibration
+  and radio-managed runtime state (current zone/VFO, GPS position).
 * **Zones → CHIRP banks** (read/write). A channel can belong to several zones
   (MTOBankModel). Add/remove channels, rename, create new zones (up to 68). The
   Banks tab shows in-use zones plus a few spare slots (not all 68) and uses a
@@ -54,8 +84,19 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
   RX-group read/edit, channel contact/TG dropdowns, DTMF read/create, boot text,
   DMR-ID DB status, bank-count limit + membership cache, tuning steps, DMR-ID
   CSV import (parse/build/upload), per-channel power + extras round-trip,
-  per-channel encryption (round-trip, off, DMR-ID exclusion).
-  `python run_tests.py` → 46 passed.
+  per-channel encryption (round-trip, off, DMR-ID exclusion), radio-wide settings
+  (decode incl. signed/enum/bitfield, edit round-trip, neighbour + magic + bank-bit
+  preservation, no-clobber without magic), VFO A/B special channels (listed,
+  empty-when-blank, decode + edit round-trip, name preserved, per-slot write,
+  not-deletable), and a guard that every settings/extras dropdown is built with
+  `current_index` (no `RadioSettingValueList` FutureWarning), Quick Keys
+  (decode contact/menu/empty, set contact, clear, menu + erased-empty preserved
+  byte-exact, neighbour preserved), GPS mode round-trip (baud nibble preserved),
+  satellite TLE encode (real ISS TLE round-trips to correct orbital elements,
+  freqs/CTCSS) + chain-write (append preserving AES, overwrite in place, refuse
+  without magic), time-zone round-trip (offset + local-flag bit preserved), and a
+  guard that every settings/extras item has an explanation tooltip (`set_doc`).
+  `python run_tests.py` → 74 passed.
 
 ## On-hardware test result (2026-06-20, COM4)
 
@@ -130,16 +171,10 @@ is no write-path blocker.
 
 ## Deferred (next phases)
 
-1. **Radio-wide settings menu** — OpenGD77 keeps its operational settings in its
-   own `nonVolatileSettings` blob (`0x604B`), NOT the TYT codeplug general-
-   settings struct (which `settings.c` leaves commented-out / unused). Those are
-   normally set on the radio; editing them from here is version-sensitive and
-   not yet done. (Callsign, DMR ID and boot screen — the codeplug-resident
-   ones — are done.)
-2. **Larger DMR-ID databases** — area 1 (~10.9k entries) is supported via CSV
+1. **Larger DMR-ID databases** — area 1 (~10.9k entries) is supported via CSV
    import. Going beyond needs the 3-byte-id + 6-bit-compressed format and area 2
    (`0xD8000`); for very large DBs use the OpenGD77 CPS downloader.
-3. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
+2. Frozen-build note: loading as a module works on the packaged Windows CHIRP;
    only a *from-source frozen rebuild* would also need the module added to
    `chirp/drivers/__init__.py:__all__` (not required for Load Module).
 
@@ -158,3 +193,16 @@ AES key management — the priority — should be verified end-to-end:
    call after the round-trip (no regression to the existing store).
 7. Sanity: confirm sibling custom-data (boot screen / theme, if present) is
    intact after the AES write.
+
+Radio-wide settings (do on a free/known setting; back up the sector first):
+
+1. Download; **Settings → Radio settings** — confirm values match the radio's
+   own menus (e.g. backlight mode/timeout, squelch, scan, VOX, hotspot type).
+2. Change one obvious setting (e.g. backlight timeout, or a toggle like
+   "Inverse video"), **Upload**, then **reboot the radio** and confirm it took
+   effect on the radio and that other settings/menus are unchanged.
+3. Confirm the radio did **not** factory-reset its settings (magic preserved).
+   If `magicNumber` were ever wrong the radio resets all settings at boot — the
+   write is guarded against this, but verify once on hardware.
+4. Back up sector 6 (raw `0x6000`, 4 KB) before testing and restore byte-exact
+   afterwards, per the usual procedure.

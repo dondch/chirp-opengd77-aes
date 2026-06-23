@@ -54,8 +54,9 @@ EEPROM-resident (read via area 2; addresses are EEPROM-relative):
 | DTMF contacts          | `0x02F88`   | 63 × 32 B |
 | Zones (in-use bitmap)  | `0x8010`    | |
 | Zones list             | `0x8030`    | 68 zones, 176 B each (OpenGD77 format, 80 ch/zone) |
-| VFO A/B channels       | `0x7590`    | two 56-B channel structs |
-| Quick keys             | `0x7524`    | protected by firmware on write |
+| VFO A/B channels       | `0x7590`    | two 56-B channel structs (`0x7590 + 56*n`, `CHANNEL_VFO_A=0`); exposed as CHIRP special channels |
+| Quick keys             | `0x7524`    | 10 × uint16 LE (long-press keys 0–9). bit15: 0=Contact (value = contact index 1–1024), 1=Menu (`menuId<<10\|entryId<<5\|functionId`). 0x0000/0x8000 = empty. Menu shortcuts preserved verbatim. Exposed in CHIRP (Settings → Quick Keys) |
+| Radio-wide settings    | `0x604B`    | 116 B `nonVolatileSettings` blob (see below) |
 
 ## Custom-data region (raw `0x20000`)
 
@@ -87,6 +88,38 @@ Total payload = 8 + 16×36 = **584**. Region image written for a fresh store =
 
 **Key byte order:** the radio/CPS key bytes are the **reverse** of the `aes256.dec` byte order.
 Keys are entered/displayed in the radio (CPS) order; the UI documents this.
+
+### SATELLITE_TLE block (`dataType=3`, `dataLength=2520`)
+
+25 × 100-byte packed records (`__attribute__((packed))`), then 20 bytes padding.
+A record with `name[0]==0` terminates the radio's read. Per record:
+
+```
++0   name              8 bytes (ASCII, not necessarily NUL-terminated)
++8   TLE_Line1         12 bytes (compressed)
++20  TLE_Line2         28 bytes (compressed)
++48  rxFreq1           u32 LE   voice downlink, 10-Hz units (Hz/10)
++52  txFreq1           u32 LE   voice uplink
++56  txCTCSS1          u16 LE   TX CTCSS, BCD of tone×10 (67.0 Hz -> 0x0670); 0 = none
++58  armCTCSS1         u16 LE   arming CTCSS (e.g. SO-50 74.4 -> 0x0744)
++60  rxFreq2 / txFreq2 2×u32 LE APRS/data pair
++68  rxFreq3 / txFreq3 2×u32 LE other pair
++76  AdditionalData    24 bytes (spare)
+```
+
+**TLE compression** (`satellite.c` `decompressTleData`): each byte holds two
+4-bit nibbles indexing `"0123456789. +-*"`, so 12 B → 24 chars (line 1) and
+28 B → 56 chars (line 2). The decompressed strings are fixed-field decimal
+numbers parsed by `atof` at set offsets:
+
+* line 1 (24 ch): `year(2) + epochDay(12) + firstDeriv(10)` ← std TLE L1
+  cols `[18:20] [20:32] [33:43]`.
+* line 2 (55 ch + pad): `inclination(8) + RAAN(8) + ecc(7,×1e-7) + argPerigee(8)
+  + meanAnomaly(8) + meanMotion(11) + revNumber(5)` ← std TLE L2
+  cols `[8:16] [17:25] [26:33] [34:42] [43:51] [52:63] [63:68]`.
+
+The importer appends this block to the custom-data chain (or overwrites in place
+if a same-size block exists), refusing if the `OpenGD77` magic is absent.
 
 ## Channel record (56 bytes, `CODEPLUG_CHANNEL_DATA_STRUCT_SIZE`)
 
@@ -140,3 +173,83 @@ Optional per-channel DMR ID: when `flag1(LibreDMR_flag1) bit7` set,
   `ringStyle:u8` + `reserve1:u8 (TS override)`. Max 1024.
 * DTMF contact: 32 B — `name[16]` + `code[16]`. Max 63.
 * General settings: 40 B — `radioName[8]` (callsign) + `radioId:u32` (DMR ID) + flags…
+
+## Radio-wide settings (`nonVolatileSettings`, raw flash `0x604B`)
+
+OpenGD77 keeps its operational settings in a flat `settingsStruct_t` blob, **not**
+in the (firmware-ignored) TYT general-settings struct. `settingsStorage.c`:
+`STORAGE_BASE_ADDRESS = 0x6000 + 0x4B = 0x604B`, written via `EEPROM_Write` (==
+raw SPI flash at offset 0). It is one contiguous `sizeof(settingsStruct_t)` dump
+— no wear-levelling — so it is read/written exactly like every other region. The
+bytes `0x6000..0x604A` just before it hold unrelated "last used channel in zone"
+data, preserved by the per-sector read-modify-write.
+
+* **Size = 116 bytes.** `magicNumber:u32` @0 **must** equal `STORAGE_MAGIC_NUMBER
+  = 0x4780`, or `settingsLoadSettings()` factory-resets every setting at boot. The
+  driver refuses to write the blob unless that magic is present (anti-reset guard,
+  like the AES anti-wipe guard), and preserves `magicNumber` + every unmanaged byte.
+* Changes load into RAM only at boot, so they take effect after a **radio reboot**.
+* **Enums are 1 byte** (firmware built `-fshort-enums`): a `roaming_t` field
+  occupies a single byte. Offsets below are the exact as-built layout of the
+  `PLATFORM_VARIANT_UV380_PLUS_10W` firmware, read from the build ELF's DWARF
+  (`readelf --debug-dump=info`), not hand-derived.
+
+| Off | Field | Type | Notes |
+|-----|-------|------|-------|
+| 0   | `magicNumber` | u32 | `0x4780`; preserved, never edited |
+| 4   | `location` | 2×u32 | GPS fixed position (radio-managed) |
+| 12  | `timezone` | u8 | bits 0-6 = UTC offset (64 = UTC, 15-min steps, UTC-12:00..+14:00), bit 7 = show-local-time flag. Exposed (offset + UTC/Local) |
+| 13  | `beepOptions` | u8 | bitmask: 1=TXstart 2=TXstop 4=RXcarrier 8=RXtalker 16=talkerbegin |
+| 14  | `vfoSweepSettings` | u16 | packed (not exposed) |
+| 16  | `overrideTG` | u32 | runtime |
+| 20  | `vfoScanLow[2]` / 28 `vfoScanHigh[2]` | u32 | VFO scan range (runtime) |
+| 36  | `bitfieldOptions[1]` | u32 | boolean toggles; bits 30-31 = bank id (preserved) |
+| 40  | `aprsBeaconingSettingsPart1[2]` | u32 | APRS (separate feature) |
+| 48  | `gpsLogMemOffset` | u32 | runtime |
+| 52  | `currentIndexInTRxGroupList[3]` / 58 `currentZone` | i16 | runtime |
+| 60  | `userPower` / 62 `tsManualOverride` | u16 | runtime |
+| 68  | `aprsBeaconingSettingsPart2` | u16 | APRS |
+| 70  | `txPowerLevel` | u8 | default TX power (power-table index) |
+| 71  | `txTimeoutBeepX5Secs` | u8 | ×5 s; 0 = off |
+| 72  | `beepVolumeDivider` | u8 | |
+| 73  | `micGainDMR` / 74 `micGainFM` | u8 | zero points 5 / 4 |
+| 75  | `backlightMode` | u8 | Auto/Squelch/Manual/Buttons/None |
+| 76  | `backLightTimeout` | u8 | seconds; 0 = never |
+| 77  | `displayContrast` | i8 | |
+| 78  | `displayBacklightPercentage[2]` | i8 | [0]=day [1]=night |
+| 80  | `displayBacklightPercentageOff` | i8 | |
+| 81  | `initialMenuNumber` | u8 | (not exposed) |
+| 82  | `extendedInfosOnScreen` | u8 | Off/TS/Power/Both |
+| 83  | `txFreqLimited` | u8 | band limits: None/Legacy/From-CPS |
+| 84  | `scanModePause` | u8 | Hold/Pause/Stop |
+| 85  | `scanDelay` / 88 `scanStepTime` | u8 | |
+| 86  | `dmrRxAGC` | u8 | |
+| 87  | `hotspotType` | u8 | Off/MMDVM/BlueDV |
+| 89  | `currentVFONumber` | u8 | runtime |
+| 90  | `dmrDestinationFilter` | u8 | None/TG/Contact/TGlist |
+| 91  | `dmrCaptureTimeout` | u8 | seconds |
+| 92  | `dmrCcTsFilter` | u8 | None/CC(1)/TS(2)/CC+TS(3) |
+| 93  | `analogFilterLevel` | u8 | None/CTCSS-DCS |
+| 94  | `privateCalls` | u8 | Off/On/PTT |
+| 95  | `contactDisplayPriority` | u8 | CC/DB/TA orderings |
+| 96  | `splitContact` | u8 | Single/Two-lines/Auto |
+| 97  | `voxThreshold` | u8 | 0 = disabled |
+| 98  | `voxTailUnits` | u8 | ×500 ms |
+| 99  | `audioPromptMode` | u8 | Silent/Beep/NoKeyBeep/Voice1-3 |
+| 100 | `temperatureCalibration` | i8 | factory cal (not exposed) |
+| 101 | `batteryCalibration` | u8 | factory cal (not exposed) |
+| 102 | `squelchDefaults[3]` | u8 | VHF / 220 / UHF |
+| 105 | `ecoLevel` | u8 | 0..5 |
+| 106 | `apo` | u8 | ×30 min; 0 = off |
+| 107 | `keypadTimerLong` / 108 `keypadTimerRepeat` | u8 | |
+| 109 | `autolockTimer` | u8 | minutes; 0 = off |
+| 110 | `roaming` | u8 (enum) | Off/Manual/5/10/20 km |
+| 111 | `gpsModeAndBaudsIndex` | u8 | low nibble = GPS mode (0=not-detected,1=Off,2=On,3=NMEA,4=Log), high nibble = baud index. Mode exposed; baud preserved |
+| 112 | `lastTalkerOnScreenTimer` | u8 | seconds 0..30 |
+
+`bitfieldOptions[0]` boolean toggles exposed (bit → meaning): 0 inverse video,
+1 PTT latch, 3 battery voltage in header, 5 TX/RX freq lock, 6 all LEDs off,
+7 scan on boot, 9 satellite auto, 12 ignore DMR CRC, 13 APO counts RF, 14 safe
+power-on, 15 auto-night, 19 secondary language, 21 channel distance, 25 TX
+inhibit, 27 channels read-only, 28 double-height UI. Bits 30-31 (storage bank id)
+and every unexposed bit are preserved on write.

@@ -5,3 +5,7 @@ _dbg.txt
 _testout.txt
 _debug.py
 .pytest_cache/
+# Downloaded codeplugs / images may contain personal data (callsign, DMR ID,
+# AES keys) -- never commit them.
+*.img
+*.g77

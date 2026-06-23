@@ -33,6 +33,7 @@ USB CDC ACM port, VID:PID 1FC9:0094, 115200 baud.
 """
 
 import logging
+import re
 import struct
 import time
 
@@ -72,6 +73,7 @@ CUSTOM_DATA_ADDR = FLASH_OFFSET                      # 0x20000
 CUSTOM_MAGIC = b"OpenGD77"
 CUSTOM_HDR_LEN = 12                                  # magic(8) + reserved(4)
 CUSTOM_TYPE_AES_KEYS = 6
+CUSTOM_TYPE_SATELLITE = 3                            # SATELLITE_TLE block
 CUSTOM_TYPE_EMPTY = 0xFFFFFFFF
 
 # AES key block
@@ -92,6 +94,29 @@ EE_CH_BITMAP_ADDR = 0x3780
 EE_CH_DATA_ADDR = 0x3790
 FLASH_CH_BITMAP_ADDR = FLASH_OFFSET + 0x7B1B0        # 0x9B1B0 (bank 1 bitmap)
 FLASH_BANK_STRIDE = 16 + CH_PER_BANK * CH_SIZE       # 7184
+
+# VFO A/B: two CodeplugChannel_t (56 B) structs at EEPROM 0x7590, indexed by
+# Channel_t (CHANNEL_VFO_A = 0, CHANNEL_VFO_B = 1).  Surfaced as CHIRP special
+# channels.  Their synthetic memory numbers sit just above the normal range.
+VFO_ADDR = 0x7590
+VFO_NAMES = ["VFO A", "VFO B"]
+VFO_A_NUMBER = CH_MAX + 1
+
+# Quick keys: 10 * uint16 (LE) at EEPROM 0x7524 -- the long-press number-key
+# (0-9) shortcuts.  Each 16-bit value: bit15 = type (0 = Contact, 1 = Menu).
+# A Contact quick key stores the contact index (1..1024); a Menu quick key packs
+# (menuId<<10 | entryId<<5 | functionId) and is version-specific, so we preserve
+# those verbatim rather than decode them.  0x0000/0x8000 = empty/cleared.
+QUICKKEYS_ADDR = 0x7524
+QUICKKEYS_COUNT = 10
+QUICKKEYS_LEN = QUICKKEYS_COUNT * 2                  # 20 bytes
+
+
+def _quickkey_is_empty(v):
+    """True if @v should be shown as an empty quick-key slot (matches the
+    firmware's notion plus the erased-flash value)."""
+    return (v in (0x0000, 0x8000, 0xFFFF) or
+            (not (v & 0x8000) and not (1 <= v <= CONTACTS_MAX)))
 
 # General settings (EEPROM region == raw flash offset 0)
 GENSET_ADDR = 0x00E0            # callsign[8] @0xE0, radioId(BCD BE)[4] @0xE8
@@ -153,6 +178,24 @@ DMRID_CONTACT_LEN = 24                                  # 4-byte id + 20-byte te
 DMRID_AREA1_BYTES = 0x40000 - DMRID_HEADER_LEN
 DMRID_MAX_ENTRIES = DMRID_AREA1_BYTES // DMRID_CONTACT_LEN
 
+# Radio-wide settings (OpenGD77 nonVolatileSettings, settingsStruct_t).  Stored
+# as a flat blob in the EEPROM region (== raw flash at offset 0) at
+# STORAGE_BASE_ADDRESS = 0x6000 + 0x4B.  magicNumber (offset 0, u32) must stay
+# SETTINGS_MAGIC or the firmware factory-resets every setting on the next boot.
+# SETTINGS_LEN and all field offsets are the exact as-built layout of the
+# UV380_PLUS_10W firmware, taken from the build's ELF DWARF (see FORMAT.md).
+# 0x6000..0x604A holds unrelated "last used channel in zone" data, which the
+# per-sector read-modify-write write path preserves.  Changes take effect on the
+# next radio reboot (settings load into RAM at boot).
+SETTINGS_ADDR = 0x604B
+SETTINGS_LEN = 116
+SETTINGS_MAGIC = 0x4780
+SETTINGS_BITOPTS_OFF = 36       # bitfieldOptions[0] (u32); bits 30-31 = bank id
+SETTINGS_GPSMODE_OFF = 111      # gpsModeAndBaudsIndex: low nibble = GPS mode,
+#                                 high nibble = baud index (preserved on write)
+SETTINGS_TZ_OFF = 12            # timezone byte: bits 0-6 = UTC offset (64 = UTC,
+#                                 15-min steps), bit 7 = show-local-time flag
+
 CSS_NONE = 0xFFFF
 
 # --------------------------------------------------------------------------
@@ -173,7 +216,10 @@ IMG_DTMF = IMG_RXGROUP + RXGROUP_REGION_LEN
 IMG_BOOT = IMG_DTMF + DTMF_REGION_LEN
 IMG_BOOTTYPE = IMG_BOOT + BOOT_LINES_LEN
 IMG_DMRIDHDR = IMG_BOOTTYPE + 1
-IMAGE_SIZE = IMG_DMRIDHDR + DMRID_HEADER_LEN
+IMG_SETTINGS = IMG_DMRIDHDR + DMRID_HEADER_LEN
+IMG_VFO = IMG_SETTINGS + SETTINGS_LEN
+IMG_QUICKKEYS = IMG_VFO + len(VFO_NAMES) * CH_SIZE
+IMAGE_SIZE = IMG_QUICKKEYS + QUICKKEYS_LEN
 
 _RANGES = [
     # (image_offset, area, device_addr, length)
@@ -189,6 +235,9 @@ _RANGES = [
     (IMG_BOOT, AREA_EEPROM, BOOT_LINES_ADDR, BOOT_LINES_LEN),
     (IMG_BOOTTYPE, AREA_EEPROM, BOOT_INTRO_ADDR, 1),
     (IMG_DMRIDHDR, AREA_FLASH, DMRID_HEADER_ADDR, DMRID_HEADER_LEN),
+    (IMG_SETTINGS, AREA_EEPROM, SETTINGS_ADDR, SETTINGS_LEN),
+    (IMG_VFO, AREA_EEPROM, VFO_ADDR, len(VFO_NAMES) * CH_SIZE),
+    (IMG_QUICKKEYS, AREA_EEPROM, QUICKKEYS_ADDR, QUICKKEYS_LEN),
 ]
 
 # Writable spans: (image_offset, raw_flash_addr, length).  All written through
@@ -205,6 +254,188 @@ _WRITE_SPANS = [
     (IMG_DTMF, DTMF_ADDR, DTMF_REGION_LEN),
     (IMG_BOOT, BOOT_LINES_ADDR, BOOT_LINES_LEN),
     (IMG_BOOTTYPE, BOOT_INTRO_ADDR, 1),
+    (IMG_SETTINGS, SETTINGS_ADDR, SETTINGS_LEN),
+    (IMG_VFO, VFO_ADDR, len(VFO_NAMES) * CH_SIZE),
+    (IMG_QUICKKEYS, QUICKKEYS_ADDR, QUICKKEYS_LEN),
+]
+
+# --------------------------------------------------------------------------
+# Radio-wide settings field model (settingsStruct_t).  Enum option lists are in
+# the firmware's enum order (index == stored byte value).  See FORMAT.md.
+# --------------------------------------------------------------------------
+RS_BACKLIGHT = ["Auto", "Squelch", "Manual", "Buttons", "None"]
+RS_HOTSPOT = ["Off", "MMDVM", "BlueDV"]
+RS_CONTACT_PRIO = ["CC>DB>TA", "DB>CC>TA", "TA>CC>DB", "TA>DB>CC"]
+RS_SCAN_MODE = ["Hold", "Pause", "Stop"]
+RS_SPLIT_CONTACT = ["Single line", "Two lines", "Auto"]
+RS_PRIVATE_CALLS = ["Off", "On", "PTT only"]
+RS_BAND_LIMITS = ["None", "Legacy default", "From CPS"]
+RS_INFO_SCREEN = ["Off", "Timeslot", "Power", "Both"]
+RS_ROAMING = ["Off", "Manual", "5 km", "10 km", "20 km"]
+RS_AUDIO_PROMPT = ["Silent", "Beep", "No key beep", "Voice 1", "Voice 2",
+                   "Voice 3"]
+RS_DMR_DEST_FILTER = ["None", "TG", "Contact", "TG list"]
+RS_DMR_CCTS_FILTER = ["None", "CC", "TS", "CC+TS"]
+RS_ANALOG_FILTER = ["None", "CTCSS/DCS"]
+# GPS mode = low nibble of gpsModeAndBaudsIndex; values OFF=1, ON=2, NMEA=3,
+# LOG=4 (0 = "not detected", a runtime state).  Index here = value - 1.
+RS_GPS_MODES = ["Off", "On", "On + NMEA out", "On + logging"]
+
+
+def _build_tz_offsets():
+    """UTC-offset labels for the timezone byte's low 7 bits.  List index i maps
+    to stored value 16 + i (64 = UTC, 15-min steps, UTC-12:00 .. UTC+14:00)."""
+    out = []
+    for tz in range(16, 121):
+        total = (tz - 64) * 15                  # minutes from UTC
+        if total == 0:
+            out.append("UTC")
+        else:
+            out.append("UTC%s%d:%02d" % ("+" if total > 0 else "-",
+                                         abs(total) // 60, abs(total) % 60))
+    return out
+
+
+RS_TZ_OFFSETS = _build_tz_offsets()
+RS_TZ_DISPLAY = ["UTC", "Local"]
+
+# Each entry: (subgroup, key, offset, kind, opt, label, doc)
+#   kind "int":  opt = (lo, hi)         -- unsigned byte
+#   kind "sint": opt = (lo, hi)         -- signed int8
+#   kind "list": opt = options list     -- stored byte = index
+# Displayed integer ranges widen to fit any out-of-range stored value, so an
+# untouched control never clamps/corrupts the stored byte on write-back.
+SETTINGS_FIELDS = [
+    # Audio
+    ("rs_audio", "set_beepOptions", 13, "int", (0, 63),
+     "DMR beep events (bitmask)",
+     "1=TX start, 2=TX stop, 4=RX carrier, 8=RX talker, 16=talker begin"),
+    ("rs_audio", "set_beepVolumeDivider", 72, "int", (0, 10),
+     "Beep volume divider", "Key/system beep volume; higher value = quieter."),
+    ("rs_audio", "set_micGainDMR", 73, "int", (0, 15),
+     "Mic gain, DMR", "Microphone gain for DMR transmit (default = 5)."),
+    ("rs_audio", "set_micGainFM", 74, "int", (0, 31),
+     "Mic gain, FM", "Microphone gain for FM transmit (default = 4)."),
+    ("rs_audio", "set_audioPromptMode", 99, "list", RS_AUDIO_PROMPT,
+     "Audio prompts",
+     "Feedback for menus/keys: silent, a beep, or spoken voice prompts."),
+    ("rs_audio", "set_voxThreshold", 97, "int", (0, 30),
+     "VOX threshold", "Voice-activated TX sensitivity; 0 = VOX disabled."),
+    ("rs_audio", "set_voxTailUnits", 98, "int", (0, 10),
+     "VOX tail", "How long TX stays keyed after you stop talking (units of 500 ms)."),
+    # Display
+    ("rs_display", "set_backlightMode", 75, "list", RS_BACKLIGHT,
+     "Backlight mode",
+     "When the backlight is on: Auto (activity), Squelch, Manual, Buttons, None."),
+    ("rs_display", "set_backLightTimeout", 76, "int", (0, 255),
+     "Backlight timeout (s)",
+     "Seconds the backlight stays on after activity; 0 = never time out."),
+    ("rs_display", "set_blPercentDay", 78, "int", (0, 100),
+     "Backlight brightness, day (%)", "Daytime backlight brightness."),
+    ("rs_display", "set_blPercentNight", 79, "int", (0, 100),
+     "Backlight brightness, night (%)", "Night-mode backlight brightness."),
+    ("rs_display", "set_blPercentOff", 80, "sint", (0, 100),
+     "Backlight brightness, off (%)", "Dimmed backlight level when 'off'."),
+    ("rs_display", "set_displayContrast", 77, "sint", (0, 63),
+     "Display contrast", "LCD contrast."),
+    ("rs_display", "set_extendedInfosOnScreen", 82, "list", RS_INFO_SCREEN,
+     "Extra info on screen",
+     "Extra status on the home screen: timeslot, power, both, or off."),
+    ("rs_display", "set_lastTalkerOnScreenTimer", 112, "int", (0, 30),
+     "Last-talker on screen (s)",
+     "Seconds to keep the last DMR talker shown; 0 = off."),
+    # Scan
+    ("rs_scan", "set_scanModePause", 84, "list", RS_SCAN_MODE,
+     "Scan resume mode",
+     "On a busy channel: Hold (stay), Pause (resume after delay), or Stop."),
+    ("rs_scan", "set_scanDelay", 85, "int", (0, 30),
+     "Scan delay (s)",
+     "Seconds to wait on a busy channel before resuming (Pause mode)."),
+    ("rs_scan", "set_scanStepTime", 88, "int", (0, 15),
+     "Scan step time", "Dwell time on each channel while scanning."),
+    # DMR
+    ("rs_dmr", "set_dmrDestinationFilter", 90, "list", RS_DMR_DEST_FILTER,
+     "DMR destination filter",
+     "Which DMR calls open the squelch: none, matching TG, contact, or TG list."),
+    ("rs_dmr", "set_dmrCcTsFilter", 92, "list", RS_DMR_CCTS_FILTER,
+     "DMR CC/TS filter",
+     "Require a matching colour code and/or timeslot to hear a DMR call."),
+    ("rs_dmr", "set_dmrCaptureTimeout", 91, "int", (0, 30),
+     "DMR capture (hang) time (s)",
+     "Seconds the monitor holds a DMR call after it ends."),
+    ("rs_dmr", "set_dmrRxAGC", 86, "int", (0, 10), "DMR RX AGC",
+     "DMR receive audio automatic gain control."),
+    ("rs_dmr", "set_analogFilterLevel", 93, "list", RS_ANALOG_FILTER,
+     "Analog filter", "Analog RX squelch by CTCSS/DCS, or none."),
+    ("rs_dmr", "set_privateCalls", 94, "list", RS_PRIVATE_CALLS,
+     "Private calls", "Allow DMR private calls: off, on, or PTT-only."),
+    ("rs_dmr", "set_contactDisplayPriority", 95, "list", RS_CONTACT_PRIO,
+     "Contact display priority",
+     "Order used to identify a caller (colour code / DB lookup / talker alias)."),
+    ("rs_dmr", "set_splitContact", 96, "list", RS_SPLIT_CONTACT,
+     "Split contact display",
+     "Show long contact names on one line, two lines, or auto."),
+    ("rs_dmr", "set_roaming", 110, "list", RS_ROAMING, "DMR roaming",
+     "DMR roaming between repeaters in a roaming zone (off/manual/by distance)."),
+    # Power & timers
+    ("rs_power", "set_txPowerLevel", 70, "int", (0, 9),
+     "Default TX power level",
+     "Default transmit power (index into the radio's power table)."),
+    ("rs_power", "set_txTimeoutBeep", 71, "int", (0, 255),
+     "TX timeout warning beep",
+     "Warning beep this many x5 s before the TX time-out; 0 = off."),
+    ("rs_power", "set_apo", 106, "int", (0, 24),
+     "Auto power off", "Switch off after idle (units of 30 min); 0 = off."),
+    ("rs_power", "set_ecoLevel", 105, "int", (0, 5),
+     "Power-saving (eco) level", "0 = off, 5 = most aggressive power saving."),
+    ("rs_power", "set_keypadTimerLong", 107, "int", (0, 15),
+     "Keypad long-press time", "How long a key must be held for a long press."),
+    ("rs_power", "set_keypadTimerRepeat", 108, "int", (0, 15),
+     "Keypad repeat time", "Auto-repeat rate when a key is held down."),
+    ("rs_power", "set_autolockTimer", 109, "int", (0, 255),
+     "Auto-lock (min)", "Auto-lock the keypad after this many minutes idle; 0 = off."),
+    ("rs_power", "set_hotspotType", 87, "list", RS_HOTSPOT,
+     "Hotspot mode", "USB hotspot mode when connected to a host (Off/MMDVM/BlueDV)."),
+    ("rs_power", "set_txFreqLimited", 83, "list", RS_BAND_LIMITS,
+     "Band (TX) limits",
+     "Enforce TX band limits: none, legacy defaults, or the CPS limits."),
+]
+
+# Boolean toggles packed in bitfieldOptions[0] (u32 @ SETTINGS_BITOPTS_OFF).
+# (key, bit, label, doc).  Only bits that exist on the UV380_PLUS_10W build.
+SETTINGS_BITS = [
+    ("set_bit_inverseVideo", 0, "Inverse video",
+     "Inverted display (dark text on light background)."),
+    ("set_bit_pttLatch", 1, "PTT latch",
+     "Tap PTT to start/stop TX instead of holding it down."),
+    ("set_bit_battVoltInHeader", 3, "Show battery voltage in header",
+     "Show the battery voltage in the top status bar."),
+    ("set_bit_txRxFreqLock", 5, "TX/RX frequency lock",
+     "Lock the TX/RX frequencies so they can't be changed from the keypad."),
+    ("set_bit_allLedsOff", 6, "Disable all LEDs",
+     "Turn off the green/red status LEDs."),
+    ("set_bit_scanOnBoot", 7, "Scan on boot",
+     "Start scanning automatically at power-on."),
+    ("set_bit_satelliteAuto", 9, "Satellite predictions auto",
+     "Auto-select the next satellite pass instead of choosing manually."),
+    ("set_bit_dmrCrcIgnored", 12, "Ignore DMR CRC",
+     "Ignore DMR CRC errors (helps with some non-standard systems)."),
+    ("set_bit_apoWithRf", 13, "Auto power off counts RF activity",
+     "Let received RF activity reset the auto-power-off timer."),
+    ("set_bit_safePowerOn", 14, "Safe power-on (long press)",
+     "Require a long press of the power button to switch the radio on."),
+    ("set_bit_autoNight", 15, "Automatic night mode",
+     "Switch to the night colour theme automatically."),
+    ("set_bit_secondaryLanguage", 19, "Use secondary language",
+     "Use the firmware's secondary (alternate) UI language."),
+    ("set_bit_channelDistance", 21, "Show channel distance",
+     "Show the distance to a channel/contact (needs a location)."),
+    ("set_bit_txInhibit", 25, "TX inhibit",
+     "Block all transmit (receive-only)."),
+    ("set_bit_channelsReadOnly", 27, "Channels read-only",
+     "Prevent editing channels from the keypad."),
+    ("set_bit_doubleHeightUI", 28, "Double-height font UI",
+     "Use a larger double-height font for the user interface."),
 ]
 
 HEX = "0123456789abcdefABCDEF"
@@ -374,6 +605,151 @@ def build_dmrid_db(records, contact_len=DMRID_CONTACT_LEN):
     header[3] = (0x4A + contact_len) & 0xFF
     struct.pack_into("<I", header, 8, len(recs))
     return bytes(header) + bytes(body), len(recs), truncated
+
+
+# --------------------------------------------------------------------------
+# Satellite (TLE / keps) codec.  The radio stores up to 25 sats in the OpenGD77
+# custom-data SATELLITE_TLE block (type 3): per sat a packed 100-byte record =
+# name[8] + compressed TLE line1[12] + line2[28] + three RX/TX freq pairs
+# (10-Hz units) + TX/arm CTCSS (BCD x10) + 24 spare.  Each TLE line is the
+# firmware-expected fixed-field decimal string (24 / 56 chars) nibble-packed
+# 2 chars/byte via the lookup "0123456789. +-*" (see satellite.c
+# decompressTleData / satelliteTLE2Native).  All pure + host-tested.
+# --------------------------------------------------------------------------
+SAT_COUNT = 25
+SAT_REC_LEN = 100
+SAT_BLOCK_LEN = 2520
+SAT_NAME_LEN = 8
+SAT_COMPRESS_LUT = "0123456789. +-*"
+
+
+def _sat_compress_line(s, nbytes):
+    """Nibble-pack a decompressed field string (chars from SAT_COMPRESS_LUT) into
+    @nbytes bytes, 2 chars/byte; right-pad with '0' to fill."""
+    s = (s + "0" * (2 * nbytes))[:2 * nbytes]
+    out = bytearray(nbytes)
+    for i in range(nbytes):
+        out[i] = (SAT_COMPRESS_LUT.index(s[2 * i]) << 4) | \
+            SAT_COMPRESS_LUT.index(s[2 * i + 1])
+    return bytes(out)
+
+
+def _tle_line1_fields(l1):
+    """24-char decompressed line 1: year(2)+epochDay(12)+firstDeriv(10), taken
+    from the fixed columns of a standard TLE line 1."""
+    return l1[18:20] + l1[20:32] + l1[33:43]
+
+
+def _tle_line2_fields(l2):
+    """55-char decompressed line 2: inclination(8)+RAAN(8)+ecc(7)+argPerigee(8)+
+    meanAnomaly(8)+meanMotion(11)+revNumber(5) from a standard TLE line 2."""
+    return (l2[8:16] + l2[17:25] + l2[26:33] + l2[34:42] +
+            l2[43:51] + l2[52:63] + l2[63:68])
+
+
+def _css_to_bcd(tone_hz):
+    """CTCSS Hz (e.g. 67.0) -> firmware CSS value (BCD of tone*10); 0 = none."""
+    return _int2bcd(int(round(tone_hz * 10))) if tone_hz else 0
+
+
+def encode_satellite(name, line1, line2, freqs):
+    """Encode one 100-byte satellite record.  @freqs: optional keys rx1/tx1
+    (voice), ctcss1/arm1 (Hz), rx2/tx2 (APRS), rx3/tx3 (other); freqs in Hz are
+    stored in 10-Hz units."""
+    def f10(hz):
+        return int(round((hz or 0) / 10.0))
+    rec = bytearray(SAT_REC_LEN)
+    nm = name.encode("ascii", "ignore")[:SAT_NAME_LEN]
+    rec[0:len(nm)] = nm
+    rec[8:20] = _sat_compress_line(_tle_line1_fields(line1), 12)
+    rec[20:48] = _sat_compress_line(_tle_line2_fields(line2), 28)
+    struct.pack_into("<II", rec, 48, f10(freqs.get("rx1")), f10(freqs.get("tx1")))
+    struct.pack_into("<HH", rec, 56, _css_to_bcd(freqs.get("ctcss1")),
+                     _css_to_bcd(freqs.get("arm1")))
+    struct.pack_into("<II", rec, 60, f10(freqs.get("rx2")), f10(freqs.get("tx2")))
+    struct.pack_into("<II", rec, 68, f10(freqs.get("rx3")), f10(freqs.get("tx3")))
+    return bytes(rec)                            # rec[76:100] = spare (zero)
+
+
+def build_satellite_block(sats):
+    """Build the 2520-byte SATELLITE_TLE block from (name, l1, l2, freqs) tuples
+    (max 25).  Unused slots stay zeroed; name[0]==0 terminates the radio's read."""
+    block = bytearray(SAT_BLOCK_LEN)
+    for i, (name, l1, l2, freqs) in enumerate(sats[:SAT_COUNT]):
+        block[i * SAT_REC_LEN:(i + 1) * SAT_REC_LEN] = encode_satellite(
+            name, l1, l2, freqs)
+    return bytes(block)
+
+
+# Built-in transponder frequencies for common FM amateur satellites (Hz).
+# Matched against the TLE name via SAT_ALIASES (case-insensitive substring).
+# ISS uplink/region and sat status vary -- edit/extend as needed.
+SAT_FREQS = {
+    "ISS": dict(rx1=437800000, tx1=145990000, ctcss1=67.0,
+                rx2=145825000, tx2=145825000),  # FM cross-band repeater + APRS
+    "SO-50": dict(rx1=436795000, tx1=145850000, ctcss1=67.0, arm1=74.4),
+    "AO-91": dict(rx1=145960000, tx1=435250000, ctcss1=67.0),
+    "AO-92": dict(rx1=145880000, tx1=435350000, ctcss1=67.0),
+    "AO-27": dict(rx1=436795000, tx1=145850000),
+    "PO-101": dict(rx1=145900000, tx1=437500000, ctcss1=141.3),
+}
+SAT_ALIASES = {
+    "ISS": ["ISS", "ZARYA"],
+    "SO-50": ["SO-50", "SAUDISAT"],
+    "AO-91": ["AO-91", "RADFXSAT", "FOX-1B"],
+    "AO-92": ["AO-92", "FOX-1D"],
+    "AO-27": ["AO-27", "AO27", "EYESAT"],
+    "PO-101": ["PO-101", "DIWATA"],
+}
+
+
+def parse_tle_file(text):
+    """Parse a 2-line or 3-line TLE file -> list of (name, line1, line2)."""
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    out = []
+    i = 0
+    while i < len(lines):
+        if (lines[i].startswith("1 ") and i + 1 < len(lines) and
+                lines[i + 1].startswith("2 ")):
+            out.append(("SAT%d" % (len(out) + 1), lines[i], lines[i + 1]))
+            i += 2
+        elif (i + 2 < len(lines) and lines[i + 1].startswith("1 ") and
+                lines[i + 2].startswith("2 ")):
+            out.append((lines[i].strip(), lines[i + 1], lines[i + 2]))
+            i += 3
+        else:
+            i += 1
+    return out
+
+
+def match_satellite_freqs(name):
+    """Return a copy of the built-in freq dict for a TLE name, or None.  An alias
+    must appear as a whole token (bounded by non-alphanumerics) so e.g.
+    'SWISSCUBE' does not match the 'ISS' alias."""
+    up = name.upper()
+    for key, aliases in SAT_ALIASES.items():
+        for a in aliases:
+            if re.search(r"(?<![A-Z0-9])" + re.escape(a) + r"(?![A-Z0-9])", up):
+                return dict(SAT_FREQS[key])
+    return None
+
+
+def build_satellite_block_from_tle(text, freqs_only=True):
+    """Parse a TLE file, attach built-in freqs by name, and build the 2520-byte
+    block.  If @freqs_only, only sats with a known freq entry are kept (so the
+    radio gets usable, tunable sats).  Returns (block, names, dropped)."""
+    parsed = parse_tle_file(text)
+    sats = []
+    for name, l1, l2 in parsed:
+        fr = match_satellite_freqs(name)
+        if fr is None:
+            if freqs_only:
+                continue
+            fr = {}
+        sats.append((name, l1, l2, fr))
+        if len(sats) >= SAT_COUNT:
+            break
+    return build_satellite_block(sats), [s[0] for s in sats], len(parsed) - len(sats)
 
 
 # --------------------------------------------------------------------------
@@ -683,10 +1059,12 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         rp.experimental = (
             "This driver targets the OpenGD77-AES256 firmware.  Supported: "
             "AES-256 key management (Settings -> AES Keys), channel read/write "
-            "(memories 1-1024, analog + DMR), zones (as banks), digital + DTMF "
+            "(memories 1-1024, analog + DMR), VFO A/B (as special channels), "
+            "quick keys, zones (as banks), digital + DTMF "
             "contacts, RX groups, per-channel AES encryption, radio settings "
-            "(callsign, DMR ID, boot screen) and DMR-ID database import from a "
-            "CSV (Settings -> Radio).\n\n"
+            "(callsign, DMR ID, boot screen), the radio-wide settings menu "
+            "(Settings -> Radio settings), DMR-ID database import from a CSV and "
+            "satellite (TLE) import for the Satellite menu (Settings -> Radio).\n\n"
             "AES voice encryption is only legal on licensed commercial / PMR "
             "allocations -- NOT on amateur (ham) bands.")
         rp.pre_download = (
@@ -694,9 +1072,11 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             "2. The radio should be on (normal mode).\n"
             "3. Click OK to download.")
         rp.pre_upload = (
-            "Upload writes the AES key store and channels (only changed flash "
-            "sectors are written).  Zones, contacts and other objects are not "
-            "written back yet.")
+            "Upload writes the AES key store, channels, zones, contacts, RX "
+            "groups, DTMF, the radio settings (callsign/DMR ID/boot screen and "
+            "the radio-wide settings) and any pending DMR-ID database or "
+            "satellite-TLE import.  Only changed flash sectors are written.  "
+            "Reboot the radio afterwards for radio-wide settings to take effect.")
         return rp
 
     def get_features(self):
@@ -714,6 +1094,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         rf.has_name = True
         rf.valid_name_length = 16
         rf.memory_bounds = (1, CH_MAX)
+        rf.valid_special_chans = list(VFO_NAMES)
         rf.valid_modes = ["FM", "NFM", "DMR"]
         rf.valid_tmodes = ["", "Tone", "TSQL", "DTCS"]
         rf.valid_power_levels = self.POWER_LEVELS
@@ -805,11 +1186,22 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                     status.cur = i + 1
                     self.status_fn(status)
                     continue
+                # Safety: likewise never write the radio-settings blob unless it
+                # carries the settings magic, or the firmware would factory-reset
+                # every setting on next boot.
+                if (raw_addr == SETTINGS_ADDR and
+                        struct.unpack_from("<I", bytes(new), 0)[0] != SETTINGS_MAGIC):
+                    LOG.warning("skipping radio-settings write: no settings "
+                                "magic (would trigger a factory reset)")
+                    status.cur = i + 1
+                    self.status_fn(status)
+                    continue
                 total += _write_region(pipe, raw_addr, new, old)
                 status.cur = i + 1
                 self.status_fn(status)
             LOG.info("upload wrote %d sector(s)", total)
             self._maybe_import_dmrid(pipe)
+            self._maybe_import_satellite(pipe)
         finally:
             _close_cps(pipe)
 
@@ -842,6 +1234,87 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         self._dmrid_import_path = None
         LOG.info("DMR-ID DB import: wrote %d entries%s", n,
                  " (CSV truncated to fit)" if truncated else "")
+
+    # -- satellite (TLE) import -----------------------------------------
+    def _find_custom_block(self, pipe, dtype):
+        """Walk the OpenGD77 custom-data block chain (12-byte magic header, then
+        {type:u32, len:u32}+payload blocks up to 0x10000).  Returns:
+          ("nomagic", None)            -- region has no "OpenGD77" magic
+          ("found", (hdr_addr, dlen))  -- a block of @dtype exists
+          ("empty", hdr_addr)          -- first empty slot (append point)
+          ("full", None)               -- no empty slot before the 64 KB limit
+        Addresses are raw flash addresses."""
+        base = CUSTOM_DATA_ADDR
+        if _read_area(pipe, AREA_FLASH, base, 8) != CUSTOM_MAGIC:
+            return ("nomagic", None)
+        off = CUSTOM_HDR_LEN
+        while off + 8 <= 0x10000:
+            dtype_read, dlen = struct.unpack(
+                "<II", _read_area(pipe, AREA_FLASH, base + off, 8))
+            if dlen in (0, 0xFFFFFFFF):
+                return ("empty", base + off)
+            if dtype_read == dtype:
+                return ("found", (base + off, dlen))
+            off += 8 + dlen
+        return ("full", None)
+
+    def _write_satellite_block(self, pipe, block, progress=None):
+        """Write @block (2520 B) as the SATELLITE_TLE custom-data block: overwrite
+        an existing same-size block in place, else append at the first empty
+        slot.  Refuses if the region lacks the OpenGD77 magic (anti-wipe)."""
+        if len(block) != SAT_BLOCK_LEN:
+            raise errors.RadioError("Satellite block must be %d bytes" %
+                                    SAT_BLOCK_LEN)
+        state, info = self._find_custom_block(pipe, CUSTOM_TYPE_SATELLITE)
+        if state == "nomagic":
+            raise errors.RadioError(
+                "Custom-data region has no OpenGD77 magic; refusing to write "
+                "satellites (download from the radio first).")
+        if state == "full":
+            raise errors.RadioError(
+                "No room in the custom-data region for the satellite block.")
+        if state == "found":
+            hdr_addr, dlen = info
+            if dlen != SAT_BLOCK_LEN:
+                raise errors.RadioError(
+                    "Existing satellite block is %d bytes (expected %d); refusing "
+                    "to resize." % (dlen, SAT_BLOCK_LEN))
+            _write_region(pipe, hdr_addr + 8, block, progress=progress)
+        else:                                       # "empty" -> append
+            hdr_addr = info
+            if hdr_addr + 8 + SAT_BLOCK_LEN > CUSTOM_DATA_ADDR + 0x10000:
+                raise errors.RadioError(
+                    "No room in the custom-data region for the satellite block.")
+            payload = struct.pack("<II", CUSTOM_TYPE_SATELLITE,
+                                  SAT_BLOCK_LEN) + block
+            _write_region(pipe, hdr_addr, payload, progress=progress)
+
+    def _maybe_import_satellite(self, pipe):
+        path = getattr(self, "_satellite_import_path", None)
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                data = fh.read()
+        except OSError as e:
+            raise errors.RadioError("Cannot read TLE file %r: %s" % (path, e))
+        block, names, dropped = build_satellite_block_from_tle(data)
+        if not names:
+            raise errors.RadioError(
+                "No satellites with known frequencies found in %r (add their "
+                "frequencies to SAT_FREQS)." % path)
+        status = chirp_common.Status()
+        status.msg = "Writing %d satellite(s)" % len(names)
+
+        def prog(done, tot):
+            status.max = tot
+            status.cur = done
+            self.status_fn(status)
+
+        self._write_satellite_block(pipe, block, progress=prog)
+        self._satellite_import_path = None
+        LOG.info("satellite import: wrote %d sat(s)%s", len(names),
+                 " (%d without freqs dropped)" % dropped if dropped else "")
 
     def process_mmap(self):
         # Channels are parsed on demand in get_memory(); precompute the contact
@@ -897,16 +1370,45 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         return util.hexprint(self._img()[off:off + CH_SIZE])
 
     def get_memory(self, number):
+        if isinstance(number, str) or number > CH_MAX:
+            return self._get_vfo_memory(number)
         mem = chirp_common.Memory()
         mem.number = number
         if not self._channel_in_use(number):
             mem.empty = True
             return mem
-
         off, _, _ = self._channel_offset(number)
-        raw = self._img()[off:off + CH_SIZE]
-        mem.name = _decode_name(raw[0:16])
+        self._decode_channel(mem, self._img()[off:off + CH_SIZE])
+        return mem
 
+    def _vfo_specials(self):
+        """Map special-channel name -> synthetic memory number."""
+        return {n: VFO_A_NUMBER + i for i, n in enumerate(VFO_NAMES)}
+
+    def _get_vfo_memory(self, number):
+        # VFO A/B are full CodeplugChannel_t structs at 0x7590 -- no bitmap, no
+        # meaningful stored name, and they can't be deleted.
+        if isinstance(number, str):
+            name = number
+            num = self._vfo_specials()[name]
+        else:
+            num = number
+            name = VFO_NAMES[num - VFO_A_NUMBER]
+        mem = chirp_common.Memory()
+        mem.number = num
+        mem.extd_number = name
+        off = IMG_VFO + (num - VFO_A_NUMBER) * CH_SIZE
+        raw = self._img()[off:off + CH_SIZE]
+        if struct.unpack_from("<I", raw, 16)[0] in (0xFFFFFFFF, 0):
+            mem.empty = True
+        else:
+            self._decode_channel(mem, raw)
+        mem.name = ""                          # VFOs have no stored name
+        mem.immutable = ["name", "skip"]
+        return mem
+
+    def _decode_channel(self, mem, raw):
+        mem.name = _decode_name(raw[0:16])
         rx = _bcd2int(struct.unpack_from("<I", raw, 16)[0]) * 10
         tx = _bcd2int(struct.unpack_from("<I", raw, 20)[0]) * 10
         mem.freq = rx
@@ -938,7 +1440,6 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             mem.skip = "S"
 
         self._add_dmr_extras(mem, raw)
-        return mem
 
     @staticmethod
     def _decode_tones(mem, tx_tone, rx_tone):
@@ -967,66 +1468,93 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
 
     @staticmethod
     def _index_list(items, current_index):
-        """Build (options, current) for a 'idx: name' dropdown with a None entry,
-        ensuring the current index is always representable."""
+        """Build (options, selected_position) for a 'idx: name' dropdown with a
+        leading None entry, ensuring the current index is always representable.
+        The returned position feeds RadioSettingValueList(current_index=...)."""
         options = ["None"] + ["%d: %s" % (i, n) for i, n in items]
-        current = "None"
+        sel = 0
         if current_index:
-            current = next(("%d: %s" % (i, n) for i, n in items
-                            if i == current_index), None)
-            if current is None:
-                current = "%d: ?" % current_index
-                options.append(current)
-        return options, current
+            label = next(("%d: %s" % (i, n) for i, n in items
+                          if i == current_index), None)
+            if label is None:
+                label = "%d: ?" % current_index
+                options.append(label)
+            sel = options.index(label)
+        return options, sel
 
     def _add_dmr_extras(self, mem, raw):
         group = RadioSettingGroup("opengd77", "OpenGD77")
         flag4 = raw[51]
-        group.append(RadioSetting(
+        tot = RadioSetting(
             "tot", "Time-out timer (s, 0=off)",
-            RadioSettingValueInteger(0, 255 * 15, raw[27] * 15, 15)))
-        group.append(RadioSetting(
-            "vox", "VOX", RadioSettingValueBoolean(bool(flag4 & 0x40))))
-        group.append(RadioSetting(
+            RadioSettingValueInteger(0, 255 * 15, raw[27] * 15, 15))
+        tot.set_doc("Maximum continuous transmit time before TX is cut "
+                    "(15 s steps); 0 = no limit.")
+        group.append(tot)
+        vox = RadioSetting(
+            "vox", "VOX", RadioSettingValueBoolean(bool(flag4 & 0x40)))
+        vox.set_doc("Voice-activated transmit on this channel.")
+        group.append(vox)
+        sql = RadioSetting(
             "squelch", "Squelch (0=master, 1-21)",
-            RadioSettingValueInteger(0, 21, raw[55] if raw[55] <= 21 else 0)))
-        group.append(RadioSetting(
+            RadioSettingValueInteger(0, 21, raw[55] if raw[55] <= 21 else 0))
+        sql.set_doc("Per-channel squelch level; 0 = use the radio's master "
+                    "squelch, 1 (open) to 21 (tight).")
+        group.append(sql)
+        ask = RadioSetting(
             "all_skip", "Skip on all-scan (lone worker)",
-            RadioSettingValueBoolean(bool(flag4 & 0x10))))
+            RadioSettingValueBoolean(bool(flag4 & 0x10)))
+        ask.set_doc("Skip this channel during an all-channels scan.")
+        group.append(ask)
 
-        group.append(RadioSetting(
+        cc = RadioSetting(
             "cc", "DMR colour code",
-            RadioSettingValueInteger(0, 15, raw[44] & 0x0F)))
-        group.append(RadioSetting(
+            RadioSettingValueInteger(0, 15, raw[44] & 0x0F))
+        cc.set_doc("DMR colour code (0-15); must match the repeater/contact.")
+        group.append(cc)
+        ts = RadioSetting(
             "ts", "DMR timeslot",
-            RadioSettingValueInteger(1, 2, 2 if (raw[49] & 0x40) else 1)))
+            RadioSettingValueInteger(1, 2, 2 if (raw[49] & 0x40) else 1))
+        ts.set_doc("DMR timeslot (1 or 2) used for TX.")
+        group.append(ts)
 
-        opts, cur = self._index_list(getattr(self, "_contacts", []),
+        opts, sel = self._index_list(getattr(self, "_contacts", []),
                                      struct.unpack_from("<H", raw, 46)[0])
-        group.append(RadioSetting("contact", "Contact (TX talkgroup)",
-                                  RadioSettingValueList(opts, cur)))
+        ct = RadioSetting("contact", "Contact (TX talkgroup)",
+                          RadioSettingValueList(opts, current_index=sel))
+        ct.set_doc("The digital contact / talkgroup this channel transmits to.")
+        group.append(ct)
 
-        opts, cur = self._index_list(getattr(self, "_rxgroups", []), raw[43])
-        group.append(RadioSetting("tg_list", "RX group list",
-                                  RadioSettingValueList(opts, cur)))
+        opts, sel = self._index_list(getattr(self, "_rxgroups", []), raw[43])
+        tg = RadioSetting("tg_list", "RX group list",
+                          RadioSettingValueList(opts, current_index=sel))
+        tg.set_doc("RX group list: the talkgroups this channel listens to.")
+        group.append(tg)
 
         optional_dmrid = bool(raw[38] & 0x80)
         enc = _enc_byte_to_label(raw[41] if not optional_dmrid else 0)
+        enc_idx = ENC_OPTIONS.index(enc) if enc in ENC_OPTIONS else 0
         es = RadioSetting("encrypt", "AES encryption",
-                          RadioSettingValueList(ENC_OPTIONS, enc))
+                          RadioSettingValueList(ENC_OPTIONS, current_index=enc_idx))
         es.set_doc("Per-channel AES key (OpenGD77-AES firmware). 'Inherit' uses "
                    "the global TX key; 'Key N' forces AES key slot N; 'Off' "
                    "disables encryption. Ignored if a per-channel DMR ID is set "
                    "(they share the same byte).")
         group.append(es)
 
-        group.append(RadioSetting(
+        did = RadioSetting(
             "dmrid", "Per-channel DMR ID (0=off)",
             RadioSettingValueInteger(0, 16777215,
-                                     _channel_optional_dmrid(raw))))
+                                     _channel_optional_dmrid(raw)))
+        did.set_doc("Override your DMR ID on this channel; 0 = use the radio's "
+                    "global DMR ID. Shares a byte with AES encryption (a non-zero "
+                    "DMR ID wins).")
+        group.append(did)
         mem.extra = group
 
     def set_memory(self, mem):
+        if isinstance(mem.number, str) or mem.number > CH_MAX:
+            return self._set_vfo_memory(mem)
         img = bytearray(self._img())
         off, bm, bit = self._channel_offset(mem.number)
 
@@ -1040,8 +1568,26 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         # Modify the existing record in place (preserve OpenGD77-specific fields
         # CHIRP doesn't expose); start from a zeroed template for a new channel.
         raw = bytearray(img[off:off + CH_SIZE]) if in_use else bytearray(CH_SIZE)
+        self._encode_channel(mem, raw)
+        img[off:off + CH_SIZE] = raw
+        img[bm] |= (1 << bit)
+        self._mmap = memmap.MemoryMapBytes(bytes(img))
 
-        raw[0:16] = _encode_name(mem.name)
+    def _set_vfo_memory(self, mem):
+        num = (self._vfo_specials()[mem.number]
+               if isinstance(mem.number, str) else mem.number)
+        if mem.empty:
+            return                              # VFOs cannot be deleted
+        off = IMG_VFO + (num - VFO_A_NUMBER) * CH_SIZE
+        img = bytearray(self._img())
+        raw = bytearray(img[off:off + CH_SIZE])
+        self._encode_channel(mem, raw, set_name=False)
+        img[off:off + CH_SIZE] = raw
+        self._mmap = memmap.MemoryMapBytes(bytes(img))
+
+    def _encode_channel(self, mem, raw, set_name=True):
+        if set_name:
+            raw[0:16] = _encode_name(mem.name)
 
         struct.pack_into("<I", raw, 16, _int2bcd(mem.freq // 10))
         if mem.duplex == "-":
@@ -1102,10 +1648,6 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                     _channel_set_optional_dmrid(raw, 0)
                     if "encrypt" in ex:
                         raw[41] = _enc_label_to_byte(str(ex["encrypt"]))
-
-        img[off:off + CH_SIZE] = raw
-        img[bm] |= (1 << bit)
-        self._mmap = memmap.MemoryMapBytes(bytes(img))
 
     @staticmethod
     def _encode_tones(mem):
@@ -1292,31 +1834,43 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
     def _get_radio_settings(self):
         gs = self._img()[IMG_GENSET:IMG_GENSET + GENSET_LEN]
         radio = RadioSettingGroup("radio", "Radio")
-        radio.append(RadioSetting(
+        cs = RadioSetting(
             "callsign", "Callsign (radio name)",
-            RadioSettingValueString(0, 8, _decode_name(gs[0:8]),
-                                    autopad=False)))
+            RadioSettingValueString(0, 8, _decode_name(gs[0:8]), autopad=False))
+        cs.set_doc("Your callsign / radio name (up to 8 characters), shown on the "
+                   "radio.")
+        radio.append(cs)
         dmrid = _bcd2int(int.from_bytes(gs[8:12], "big"))
         if not (0 <= dmrid <= 16777215):        # unset / 0xFF -> show 0
             dmrid = 0
-        radio.append(RadioSetting(
+        di = RadioSetting(
             "dmrid", "DMR ID",
-            RadioSettingValueInteger(0, 16777215, dmrid)))
+            RadioSettingValueInteger(0, 16777215, dmrid))
+        di.set_doc("Your personal 7-digit DMR ID (from radioid.net). Used for all "
+                   "DMR transmits unless a channel overrides it.")
+        radio.append(di)
 
         img = self._img()
-        radio.append(RadioSetting(
+        b1 = RadioSetting(
             "boot_line1", "Boot text line 1",
             RadioSettingValueString(0, 16, _decode_name(img[IMG_BOOT:IMG_BOOT + 16]),
-                                    autopad=False)))
-        radio.append(RadioSetting(
+                                    autopad=False))
+        b1.set_doc("First line of the power-on text greeting (when boot screen = "
+                   "Text).")
+        radio.append(b1)
+        b2 = RadioSetting(
             "boot_line2", "Boot text line 2",
             RadioSettingValueString(0, 16,
                                     _decode_name(img[IMG_BOOT + 16:IMG_BOOT + 32]),
-                                    autopad=False)))
-        radio.append(RadioSetting(
+                                    autopad=False))
+        b2.set_doc("Second line of the power-on text greeting.")
+        radio.append(b2)
+        bs = RadioSetting(
             "boot_screen", "Boot screen",
             RadioSettingValueList(["Picture", "Text"],
-                                  "Text" if img[IMG_BOOTTYPE] == 1 else "Picture")))
+                                  current_index=1 if img[IMG_BOOTTYPE] == 1 else 0))
+        bs.set_doc("Power-on screen: a stored Picture, or the two Text lines above.")
+        radio.append(bs)
 
         hdr = img[IMG_DMRIDHDR:IMG_DMRIDHDR + DMRID_HEADER_LEN]
         if hdr[0:2] == b"Id":
@@ -1337,6 +1891,17 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                     "radio (up to %d entries; pre-filter larger lists). Reboot "
                     "the radio afterwards to load it." % DMRID_MAX_ENTRIES)
         radio.append(imp)
+
+        sat = RadioSetting(
+            "sat_import",
+            "Import satellites from TLE file (path; written on Upload)",
+            RadioSettingValueString(0, 255, "", autopad=False))
+        sat.set_doc("Path to a 2- or 3-line TLE file (e.g. CelesTrak amateur.txt). "
+                    "On the next Upload, satellites whose names match the built-in "
+                    "FM-transponder table (ISS, SO-50, AO-91/92/27, PO-101, ...) "
+                    "are written to the radio's Satellite menu (up to 25). Needs a "
+                    "GPS fix or set location to predict passes.")
+        radio.append(sat)
         return radio
 
     def _get_rxgroup_settings(self):
@@ -1350,13 +1915,20 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             name = self._rxgroup_name(img, i) if self._rxgroup_inuse(img, i) else ""
             members = ",".join(str(c) for c in self._rxgroup_members(img, i))
             sub = RadioSettingGroup("rxgroup_%d" % i, "RX Group %d" % i)
-            sub.append(RadioSetting(
+            gn = RadioSetting(
                 "rxgroup_%d_name" % i, "Name",
-                RadioSettingValueString(0, 16, name, autopad=False)))
-            sub.append(RadioSetting(
+                RadioSettingValueString(0, 16, name, autopad=False))
+            gn.set_doc("RX group name (blank = delete this group). A channel's "
+                       "'RX group list' points here to choose which talkgroups it "
+                       "listens to.")
+            sub.append(gn)
+            gm = RadioSetting(
                 "rxgroup_%d_members" % i, "Contact indices (comma-separated)",
                 RadioSettingValueString(0, 200, members, autopad=False,
-                                        charset="0123456789, ")))
+                                        charset="0123456789, "))
+            gm.set_doc("Contacts in this group, by their Contact number "
+                       "(1-based), comma-separated, e.g. 1,4,5.")
+            sub.append(gm)
             group.append(sub)
         return group
 
@@ -1369,13 +1941,17 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         for i in sorted(set(inuse) | set(spares)):
             name, code = self._dtmf_get(img, i)
             sub = RadioSettingGroup("dtmf_%d" % i, "DTMF %d" % i)
-            sub.append(RadioSetting(
+            dn = RadioSetting(
                 "dtmf_%d_name" % i, "Name",
-                RadioSettingValueString(0, 16, name, autopad=False)))
-            sub.append(RadioSetting(
+                RadioSettingValueString(0, 16, name, autopad=False))
+            dn.set_doc("DTMF contact name (blank = delete this entry).")
+            sub.append(dn)
+            dc = RadioSetting(
                 "dtmf_%d_code" % i, "Code (0-9 A-D * #)",
                 RadioSettingValueString(0, 16, code, autopad=False,
-                                        charset=DTMF_DIGITS)))
+                                        charset=DTMF_DIGITS))
+            dc.set_doc("DTMF digit sequence to send (digits 0-9, A-D, * and #).")
+            sub.append(dc)
             group.append(sub)
         return group
 
@@ -1389,20 +1965,154 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         for i in sorted(set(inuse) | set(spares)):
             name, num, ctype = self._contact_get(img, i)
             sub = RadioSettingGroup("contact_%d" % i, "Contact %d" % i)
-            sub.append(RadioSetting(
+            cn = RadioSetting(
                 "contact_%d_name" % i, "Name",
-                RadioSettingValueString(0, 16, name, autopad=False)))
-            sub.append(RadioSetting(
+                RadioSettingValueString(0, 16, name, autopad=False))
+            cn.set_doc("Digital contact name (blank = delete this contact).")
+            sub.append(cn)
+            cnum = RadioSetting(
                 "contact_%d_num" % i, "Number (TG/ID)",
-                RadioSettingValueInteger(0, 16777215, num)))
-            sub.append(RadioSetting(
+                RadioSettingValueInteger(0, 16777215, num))
+            cnum.set_doc("Talkgroup number (Group Call) or DMR ID (Private Call).")
+            sub.append(cnum)
+            ctp = RadioSetting(
                 "contact_%d_type" % i, "Type",
-                RadioSettingValueList(CONTACT_TYPES, CONTACT_TYPES[ctype])))
+                RadioSettingValueList(
+                    CONTACT_TYPES,
+                    current_index=ctype if ctype < len(CONTACT_TYPES) else 0))
+            ctp.set_doc("Group Call (talkgroup), Private Call (individual), or "
+                        "All Call.")
+            sub.append(ctp)
             group.append(sub)
+        return group
+
+    def _settings_blob(self):
+        return bytes(self._img()[IMG_SETTINGS:IMG_SETTINGS + SETTINGS_LEN])
+
+    def _settings_valid(self, blob=None):
+        if blob is None:
+            blob = self._settings_blob()
+        return (len(blob) >= SETTINGS_LEN and
+                struct.unpack_from("<I", blob, 0)[0] == SETTINGS_MAGIC)
+
+    def _get_radiowide_settings(self):
+        top = RadioSettingGroup("rsettings", "Radio settings")
+        blob = self._settings_blob()
+        if not self._settings_valid(blob):
+            note = RadioSetting(
+                "rsettings_note", "Radio settings",
+                RadioSettingValueString(
+                    0, 80, "Not available (no settings block on this image).",
+                    autopad=False))
+            note.set_doc("The OpenGD77 settings block was not found / not "
+                         "initialised; nothing to edit here.")
+            top.append(note)
+            return top
+
+        subs = []
+        sub_by_key = {}
+        for key, label in (("rs_audio", "Audio"), ("rs_display", "Display"),
+                           ("rs_scan", "Scan"), ("rs_dmr", "DMR"),
+                           ("rs_power", "Power & timers"),
+                           ("rs_opts", "Options")):
+            g = RadioSettingGroup(key, label)
+            subs.append(g)
+            sub_by_key[key] = g
+
+        for grp, key, off, kind, opt, label, doc in SETTINGS_FIELDS:
+            if kind == "list":
+                idx = blob[off] if blob[off] < len(opt) else 0
+                rs = RadioSetting(key, label,
+                                  RadioSettingValueList(opt, current_index=idx))
+            else:
+                val = blob[off]
+                if kind == "sint" and val >= 128:
+                    val -= 256
+                lo, hi = opt
+                rs = RadioSetting(key, label, RadioSettingValueInteger(
+                    min(lo, val), max(hi, val), val))
+            if doc:
+                rs.set_doc(doc)
+            sub_by_key[grp].append(rs)
+
+        bits = struct.unpack_from("<I", blob, SETTINGS_BITOPTS_OFF)[0]
+        for key, bit, label, doc in SETTINGS_BITS:
+            rs = RadioSetting(key, label,
+                              RadioSettingValueBoolean(bool(bits & (1 << bit))))
+            if doc:
+                rs.set_doc(doc)
+            sub_by_key["rs_opts"].append(rs)
+
+        # GPS mode = low nibble of gpsModeAndBaudsIndex (0 = "not detected", a
+        # runtime state -> shown as Off). High nibble (baud) preserved on write.
+        gmode = blob[SETTINGS_GPSMODE_OFF] & 0x0F
+        gps_rs = RadioSetting(
+            "set_gpsMode", "GPS mode",
+            RadioSettingValueList(
+                RS_GPS_MODES,
+                current_index=(gmode - 1) if 1 <= gmode <= len(RS_GPS_MODES) else 0))
+        gps_rs.set_doc("GPS receiver mode (Off / On / On+NMEA output / "
+                       "On+logging). Takes effect after a reboot; the GPS baud "
+                       "rate is preserved.")
+        sub_by_key["rs_power"].append(gps_rs)
+
+        # Time zone = low 7 bits of the timezone byte (64 = UTC, 15-min steps);
+        # bit 7 = show-local-time flag.  Both bits' neighbours are preserved.
+        tzval = blob[SETTINGS_TZ_OFF] & 0x7F
+        tzidx = tzval - 16
+        if not 0 <= tzidx < len(RS_TZ_OFFSETS):
+            tzidx = 64 - 16                     # default to UTC if out of range
+        tz_rs = RadioSetting("set_timezone", "Time zone",
+                             RadioSettingValueList(RS_TZ_OFFSETS,
+                                                   current_index=tzidx))
+        tz_rs.set_doc("UTC offset for the clock, in 15-minute steps "
+                      "(UTC-12:00 .. UTC+14:00).")
+        sub_by_key["rs_display"].append(tz_rs)
+        tl_rs = RadioSetting(
+            "set_timeLocal", "Time display",
+            RadioSettingValueList(
+                RS_TZ_DISPLAY,
+                current_index=1 if (blob[SETTINGS_TZ_OFF] & 0x80) else 0))
+        tl_rs.set_doc("Show the clock in UTC or in Local time (= UTC + the time "
+                      "zone above).")
+        sub_by_key["rs_display"].append(tl_rs)
+
+        for g in subs:
+            top.append(g)
+        return top
+
+    def _get_quickkeys_settings(self):
+        img = self._img()
+        contacts = getattr(self, "_contacts", [])
+        group = RadioSettingGroup("quickkeys", "Quick Keys")
+        for k in range(QUICKKEYS_COUNT):
+            val = struct.unpack_from("<H", img, IMG_QUICKKEYS + k * 2)[0]
+            options = ["(empty)"] + ["%d: %s" % (i, n) for i, n in contacts]
+            current = "(empty)"
+            if not _quickkey_is_empty(val):
+                if not (val & 0x8000):              # Contact quick key
+                    name = next((n for i, n in contacts if i == val), None)
+                    current = "%d: %s" % (val, name or "?")
+                    if current not in options:
+                        options.append(current)     # contact not in use -> "idx: ?"
+                else:                               # Menu shortcut -- preserved
+                    current = "Menu shortcut 0x%04X" % val
+                    options.append(current)
+            rs = RadioSetting(
+                "quickkey_%d" % k, "Long-press key %d" % k,
+                RadioSettingValueList(options, current_index=options.index(current)))
+            rs.set_doc(
+                "Long-press number key %d on the home screen to dial the chosen "
+                "contact (sets the TX talkgroup).  'Menu shortcut' entries were "
+                "assigned on the radio and are preserved; pick a contact or "
+                "(empty) to change this key." % k)
+            group.append(rs)
         return group
 
     def get_settings(self):
         radio = self._get_radio_settings()
+        rwsettings = self._get_radiowide_settings()
+        quickkeys = self._get_quickkeys_settings()
         contacts = self._get_contacts_settings()
         rxgroups = self._get_rxgroup_settings()
         dtmf = self._get_dtmf_settings()
@@ -1419,9 +2129,12 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                      "MSB-first as shown on the radio.")
         aes.append(note)
 
-        aes.append(RadioSetting(
+        tx = RadioSetting(
             "aes_txkeyid", "TX key id (0 = encrypted TX off)",
-            RadioSettingValueInteger(0, 15, store.tx_key_id)))
+            RadioSettingValueInteger(0, 15, store.tx_key_id))
+        tx.set_doc("Which AES key id (1-15) channels set to 'Inherit' transmit "
+                   "with; 0 = transmit unencrypted.")
+        aes.append(tx)
 
         # Keys are addressed by key id 1..15 (key id 0 = "off"/"inherit" in the
         # TX and per-channel selectors), matching the channel dropdowns. Each key
@@ -1430,14 +2143,20 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         # "Key id 1".
         for k in range(1, AESK_NUM_SLOTS):
             slot = store.key_for(k)
-            aes.append(RadioSetting(
+            ven = RadioSetting(
                 "aes_valid_%d" % k, "Key id %d enabled" % k,
-                RadioSettingValueBoolean(slot is not None)))
-            aes.append(RadioSetting(
+                RadioSettingValueBoolean(slot is not None))
+            ven.set_doc("Enable AES key id %d. Disable to clear/delete the key." % k)
+            aes.append(ven)
+            kv = RadioSetting(
                 "aes_key_%d" % k, "Key id %d (64 hex)" % k,
                 RadioSettingValueString(0, 64, slot.key_hex if slot else "",
-                                        autopad=False, charset=HEX)))
-        return RadioSettings(radio, contacts, rxgroups, dtmf, aes)
+                                        autopad=False, charset=HEX))
+            kv.set_doc("AES-256 key id %d: 64 hex chars (32 bytes), in radio/CPS "
+                       "byte order (reverse of aes256.dec)." % k)
+            aes.append(kv)
+        return RadioSettings(radio, rwsettings, quickkeys, contacts, rxgroups,
+                             dtmf, aes)
 
     def set_settings(self, settings):
         flat = {}
@@ -1471,6 +2190,57 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             p = str(flat["dmrid_import"].value).strip()
             if p:
                 self._dmrid_import_path = p
+        if "sat_import" in flat:
+            p = str(flat["sat_import"].value).strip()
+            if p:
+                self._satellite_import_path = p
+
+        # -- radio-wide settings (nonVolatileSettings) --
+        # Patch only the bytes of fields the user changed; magicNumber and every
+        # unmanaged byte (including the 0x6000-0x604A neighbour) are preserved,
+        # so the firmware keeps its settings and never factory-resets.
+        sbase = IMG_SETTINGS
+        if self._settings_valid(bytes(img[sbase:sbase + SETTINGS_LEN])):
+            for grp, key, off, kind, opt, label, doc in SETTINGS_FIELDS:
+                if key not in flat:
+                    continue
+                v = flat[key].value
+                if kind == "list":
+                    s = str(v)
+                    if s in opt:
+                        img[sbase + off] = opt.index(s)
+                else:
+                    img[sbase + off] = int(v) & 0xFF
+            if any(key in flat for key, _, _, _ in SETTINGS_BITS):
+                bits = struct.unpack_from("<I", bytes(img),
+                                          sbase + SETTINGS_BITOPTS_OFF)[0]
+                for key, bit, label, doc in SETTINGS_BITS:
+                    if key not in flat:
+                        continue
+                    if bool(flat[key].value):
+                        bits |= (1 << bit)
+                    else:
+                        bits &= ~(1 << bit)
+                struct.pack_into("<I", img, sbase + SETTINGS_BITOPTS_OFF,
+                                 bits & 0xFFFFFFFF)
+            if "set_gpsMode" in flat:
+                # Patch only the low (mode) nibble; keep the high (baud) nibble.
+                s = str(flat["set_gpsMode"].value)
+                mode = (RS_GPS_MODES.index(s) + 1) if s in RS_GPS_MODES else 1
+                o = sbase + SETTINGS_GPSMODE_OFF
+                img[o] = (img[o] & 0xF0) | (mode & 0x0F)
+            if "set_timezone" in flat:
+                s = str(flat["set_timezone"].value)
+                if s in RS_TZ_OFFSETS:
+                    tzv = 16 + RS_TZ_OFFSETS.index(s)   # 7-bit offset value
+                    o = sbase + SETTINGS_TZ_OFF
+                    img[o] = (img[o] & 0x80) | (tzv & 0x7F)
+            if "set_timeLocal" in flat:
+                o = sbase + SETTINGS_TZ_OFF
+                if str(flat["set_timeLocal"].value) == "Local":
+                    img[o] |= 0x80
+                else:
+                    img[o] &= ~0x80 & 0xFF
 
         # -- DTMF contacts --
         for i in range(1, DTMF_MAX + 1):
@@ -1535,6 +2305,25 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 for k in range(32):
                     struct.pack_into("<H", img, o + 16 + k * 2, 0)
 
+        # -- quick keys --
+        # Each "quickkey_N" is a dropdown: (empty) / "idx: contact" / a preserved
+        # "Menu shortcut 0xXXXX".  Leaving an already-empty slot empty keeps its
+        # exact bytes (no spurious sector write); clearing a set slot writes 0.
+        for k in range(QUICKKEYS_COUNT):
+            qk = "quickkey_%d" % k
+            if qk not in flat:
+                continue
+            off = IMG_QUICKKEYS + k * 2
+            orig = struct.unpack_from("<H", bytes(img), off)[0]
+            s = str(flat[qk].value)
+            if s.startswith("Menu shortcut 0x"):
+                val = int(s[len("Menu shortcut 0x"):][:4], 16)
+            elif s == "(empty)":
+                val = orig if _quickkey_is_empty(orig) else 0x0000
+            else:
+                val = self._parse_index(s) & 0x7FFF      # contact index (bit15=0)
+            struct.pack_into("<H", img, off, val & 0xFFFF)
+
         # -- AES key store --
         store = AesKeyStore.from_payload(
             find_aes_block(bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE]))[1])
@@ -1562,6 +2351,12 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 store.set_key(k, key)
             else:
                 store.clear_key(k)
+        # Drop unusable/corruption slots: a stored key with key id 0 ("off"
+        # sentinel) or out of 1..15 can never be selected and only appears from
+        # older buggy writes. Clearing it keeps the store clean.
+        for i, s in enumerate(store.slots):
+            if s.valid and not (1 <= s.key_id <= 15):
+                store.slots[i] = AesSlot(False, 0, b"")
         region = region_with_aes(
             bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE]), store.to_payload())
         img[IMG_AES:IMG_AES + SECTOR_SIZE] = region
