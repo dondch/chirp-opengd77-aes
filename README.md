@@ -69,12 +69,10 @@ Banks tab shows your in-use zones plus a few spare slots for new ones (reload
 the tab for more spares once those are used). The driver auto-detects the
 radio's 80- or 16-channels-per-zone format.
 
-### Key byte order (important)
+### Key entry
 
-Keys are entered and displayed in the **radio / CPS byte order**, which is the
-**reverse** of the byte order in an `aes256.dec` file. Enter the 64 hex
-characters exactly as the radio/CPS shows them (MSB first). If you have a key
-from an `aes256.dec`, reverse its 32 bytes before entering it here.
+Enter the 64 hex characters (32 bytes, MSB first) **exactly as shown in TYT CPS**
+— the same order the radio displays and uses. No byte reordering is needed.
 
 ## Contacts & RX groups
 

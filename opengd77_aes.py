@@ -1534,7 +1534,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         optional_dmrid = bool(raw[38] & 0x80)
         enc = _enc_byte_to_label(raw[41] if not optional_dmrid else 0)
         enc_idx = ENC_OPTIONS.index(enc) if enc in ENC_OPTIONS else 0
-        es = RadioSetting("encrypt", "AES encryption",
+        es = RadioSetting("encrypt", "Encrypt TX",
                           RadioSettingValueList(ENC_OPTIONS, current_index=enc_idx))
         es.set_doc("Per-channel AES key (OpenGD77-AES firmware). 'Inherit' uses "
                    "the global TX key; 'Key N' forces AES key slot N; 'Off' "
@@ -2120,17 +2120,17 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         aes = RadioSettingGroup("aes", "AES Keys")
 
         note = RadioSetting(
-            "aes_note", "Byte order",
+            "aes_note", "Key entry",
             RadioSettingValueString(
                 0, 80,
-                "Enter keys in radio/CPS order (reverse of aes256.dec).",
+                "Enter keys exactly as shown in TYT CPS.",
                 autopad=False))
         note.set_doc("Informational; keys are 64 hex chars (32 bytes), "
-                     "MSB-first as shown on the radio.")
+                     "MSB-first, exactly as shown in TYT CPS / on the radio.")
         aes.append(note)
 
         tx = RadioSetting(
-            "aes_txkeyid", "TX key id (0 = encrypted TX off)",
+            "aes_txkeyid", "Global TX key (0=off)",
             RadioSettingValueInteger(0, 15, store.tx_key_id))
         tx.set_doc("Which AES key id (1-15) channels set to 'Inherit' transmit "
                    "with; 0 = transmit unencrypted.")
@@ -2152,8 +2152,8 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                 "aes_key_%d" % k, "Key id %d (64 hex)" % k,
                 RadioSettingValueString(0, 64, slot.key_hex if slot else "",
                                         autopad=False, charset=HEX))
-            kv.set_doc("AES-256 key id %d: 64 hex chars (32 bytes), in radio/CPS "
-                       "byte order (reverse of aes256.dec)." % k)
+            kv.set_doc("AES-256 key id %d: 64 hex chars (32 bytes), MSB-first, "
+                       "exactly as shown in TYT CPS." % k)
             aes.append(kv)
         return RadioSettings(radio, rwsettings, quickkeys, contacts, rxgroups,
                              dtmf, aes)

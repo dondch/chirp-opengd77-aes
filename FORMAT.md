@@ -86,8 +86,8 @@ AES_KEYS=6, EMPTY=0xFFFFFFFF`. Block size is fixed once allocated (firmware refu
 Total payload = 8 + 16×36 = **584**. Region image written for a fresh store =
 `magic(12) + {6,584} header(8) + payload(584)` = 604 bytes at `0x20000`.
 
-**Key byte order:** the radio/CPS key bytes are the **reverse** of the `aes256.dec` byte order.
-Keys are entered/displayed in the radio (CPS) order; the UI documents this.
+**Key byte order:** keys are stored MSB-first, exactly as shown in TYT CPS / on the
+radio. Keys are entered and displayed in that same order; no reordering is applied.
 
 ### SATELLITE_TLE block (`dataType=3`, `dataLength=2520`)
 

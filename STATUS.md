@@ -13,8 +13,8 @@ Phased build toward full OpenGD77 CPS functionality + AES key management.
     slot — so a radio that stores key id 1 in slot 0 shows as "Key id 1".
   * Robust write: locates/creates the `AESK` block in the custom-data block
     chain in place, preserving sibling blocks; verifies by read-back.
-  * Validation: per-key enable, 64-hex-char enforcement, reversed-byte-order
-    note in the UI.
+  * Validation: per-key enable, 64-hex-char enforcement, key-entry note in
+    the UI (enter keys exactly as shown in TYT CPS).
 * **Channels — read & write** (memories 1–1024, analog + DMR). Name, freq,
   duplex/offset, FM/NFM/DMR mode, CTCSS/DCS tones, per-channel **power**
   (OpenGD77 `libreDMR_Power` levels: Master/50mW…10W/Max), zone-skip; Extra tab
