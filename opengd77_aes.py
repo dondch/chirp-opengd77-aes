@@ -74,6 +74,8 @@ CUSTOM_MAGIC = b"OpenGD77"
 CUSTOM_HDR_LEN = 12                                  # magic(8) + reserved(4)
 CUSTOM_TYPE_AES_KEYS = 6
 CUSTOM_TYPE_SATELLITE = 3                            # SATELLITE_TLE block
+CUSTOM_TYPE_MESSAGES = 7                             # message store (MSGS, firmware-only)
+CUSTOM_TYPE_MSG_CONFIG = 8                           # messaging config (MSGC: presets + default)
 CUSTOM_TYPE_EMPTY = 0xFFFFFFFF
 
 # AES key block
@@ -84,6 +86,16 @@ AESK_SLOT_SIZE = 36                                  # valid,keyId,rsvd2,key32
 AESK_HDR_LEN = 8                                     # "AESK"+ver+tx+rsvd2
 AESK_PAYLOAD_LEN = AESK_HDR_LEN + AESK_NUM_SLOTS * AESK_SLOT_SIZE  # 584
 AESK_KEY_LEN = 32
+
+# Encrypted-SMS config block (MSGC).  Shared byte-for-byte with the firmware
+# (functions/dmr_sms.c MsgCfg): quick-text presets + a default recipient.
+MSGC_MAGIC = b"MSGC"
+MSGC_VERSION = 1
+MSGC_NUM_PRESETS = 10
+MSGC_PRESET_LEN = 48                                 # ASCII, NUL-padded
+# header: magic(4) ver(1) numPresets(1) defaultGroup(1) rsvd(1) defaultDst(uint32 LE)
+MSGC_HDR_LEN = 12
+MSGC_PAYLOAD_LEN = MSGC_HDR_LEN + MSGC_NUM_PRESETS * MSGC_PRESET_LEN  # 492
 
 # Channels
 CH_SIZE = 56
@@ -439,6 +451,10 @@ SETTINGS_BITS = [
 ]
 
 HEX = "0123456789abcdefABCDEF"
+
+# Printable ASCII allowed in quick-text presets (kept ASCII so it survives the
+# firmware's UTF-16LE round-trip and the radio's character set).
+MSG_PRESET_CHARSET = "".join(chr(c) for c in range(0x20, 0x7F))
 
 
 # --------------------------------------------------------------------------
@@ -882,6 +898,84 @@ def region_with_aes(region, payload):
         struct.pack_into("<II", region, hdr_off,
                          CUSTOM_TYPE_AES_KEYS, AESK_PAYLOAD_LEN)
     region[hdr_off + 8:hdr_off + 8 + AESK_PAYLOAD_LEN] = payload
+    return bytes(region)
+
+
+class MsgConfig(object):
+    """Parsed MSGC payload: quick-text presets + a default recipient.  Shared
+    byte-for-byte with the firmware (functions/dmr_sms.c)."""
+
+    def __init__(self, default_dst=0, default_group=True, presets=None, max_len=0):
+        self.default_dst = default_dst
+        self.default_group = default_group
+        self.max_len = max_len            # header byte 7; 0 = firmware default (144)
+        self.presets = list(presets) if presets else [""] * MSGC_NUM_PRESETS
+        self.presets = (self.presets + [""] * MSGC_NUM_PRESETS)[:MSGC_NUM_PRESETS]
+
+    @classmethod
+    def from_payload(cls, payload):
+        if not payload or payload[:4] != MSGC_MAGIC or len(payload) < MSGC_HDR_LEN:
+            return cls()
+        default_group = bool(payload[6])
+        max_len = payload[7] if len(payload) > 7 else 0
+        default_dst = struct.unpack_from("<I", payload, 8)[0]
+        presets = []
+        for i in range(MSGC_NUM_PRESETS):
+            o = MSGC_HDR_LEN + i * MSGC_PRESET_LEN
+            raw = bytes(payload[o:o + MSGC_PRESET_LEN])
+            presets.append(raw.split(b"\x00", 1)[0].decode("ascii", "ignore"))
+        return cls(default_dst, default_group, presets, max_len)
+
+    def to_payload(self):
+        p = bytearray(b"\x00" * MSGC_PAYLOAD_LEN)
+        p[0:4] = MSGC_MAGIC
+        p[4] = MSGC_VERSION
+        p[5] = MSGC_NUM_PRESETS
+        p[6] = 1 if self.default_group else 0
+        p[7] = self.max_len & 0xFF        # firmware clamps to [1,144]; 0 = default 144
+        struct.pack_into("<I", p, 8, self.default_dst & 0xFFFFFFFF)
+        for i in range(MSGC_NUM_PRESETS):
+            o = MSGC_HDR_LEN + i * MSGC_PRESET_LEN
+            t = self.presets[i].encode("ascii", "ignore")[:MSGC_PRESET_LEN]
+            p[o:o + len(t)] = t
+        return bytes(p)
+
+
+def find_block(region, dtype):
+    """Walk the custom-data chain; return (header_offset, payload_bytes) for the
+    block of type @dtype, or (None, None)."""
+    if region[:8] != CUSTOM_MAGIC:
+        return None, None
+    off = CUSTOM_HDR_LEN
+    while off + 8 <= len(region):
+        t, dlen = struct.unpack_from("<II", region, off)
+        if t == CUSTOM_TYPE_EMPTY or dlen == 0 or dlen == 0xFFFFFFFF:
+            return None, None
+        if t == dtype:
+            return off, bytes(region[off + 8:off + 8 + dlen])
+        off += 8 + dlen
+    return None, None
+
+
+def region_with_block(region, dtype, payload):
+    """Return a copy of the custom-data @region with the @dtype block set to
+    @payload, preserving siblings (overwrite in place if same size, else append).
+    The region must already carry the OpenGD77 magic (the AES path lays it down)."""
+    region = bytearray(region)
+    if region[:8] != CUSTOM_MAGIC:
+        out = bytearray(b"\xFF" * len(region))
+        out[0:8] = CUSTOM_MAGIC
+        struct.pack_into("<II", out, CUSTOM_HDR_LEN, dtype, len(payload))
+        out[CUSTOM_HDR_LEN + 8:CUSTOM_HDR_LEN + 8 + len(payload)] = payload
+        return bytes(out)
+    hdr_off, cur = find_block(region, dtype)
+    if hdr_off is None or (cur is not None and len(cur) != len(payload)):
+        hdr_off = find_chain_end(region)
+        if hdr_off is None or hdr_off + 8 + len(payload) > len(region):
+            raise errors.RadioError(
+                "No room in the custom-data region for a 0x%02X block" % dtype)
+        struct.pack_into("<II", region, hdr_off, dtype, len(payload))
+    region[hdr_off + 8:hdr_off + 8 + len(payload)] = payload
     return bytes(region)
 
 
@@ -1338,6 +1432,10 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
     def _read_aes_store(self):
         _, payload = find_aes_block(self._aes_region())
         return AesKeyStore.from_payload(payload)
+
+    def _read_msg_config(self):
+        _, payload = find_block(self._aes_region(), CUSTOM_TYPE_MSG_CONFIG)
+        return MsgConfig.from_payload(payload)
 
     def _write_aes_store(self, store):
         img = bytearray(self._img())
@@ -2109,6 +2207,53 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
             group.append(rs)
         return group
 
+    def _get_messages_settings(self):
+        """Messages tab: quick-text presets + a default recipient.  Written to
+        the MSGC custom-data block, read on-radio by the Messages menu."""
+        cfg = self._read_msg_config()
+        group = RadioSettingGroup("messages", "Messages")
+
+        note = RadioSetting(
+            "msg_note", "Encrypted SMS",
+            RadioSettingValueString(
+                0, 80, "Quick-text presets + default recipient.", autopad=False))
+        note.set_doc("These configure the on-radio Messages menu (New Message). "
+                     "The per-channel message key is the channel 'Encrypt' field.")
+        group.append(note)
+
+        dst = RadioSetting(
+            "msg_default_dst", "Default recipient (TG/ID)",
+            RadioSettingValueInteger(0, 16777215, cfg.default_dst))
+        dst.set_doc("Talkgroup or DMR ID pre-filled when composing a new message "
+                    "(0 = use the current channel's contact).")
+        group.append(dst)
+
+        grp = RadioSetting(
+            "msg_default_group", "Default recipient type",
+            RadioSettingValueList(
+                ["Group", "Private"],
+                current_index=(0 if cfg.default_group else 1)))
+        grp.set_doc("Whether the default recipient is a talkgroup (Group) or an "
+                    "individual DMR ID (Private).")
+        group.append(grp)
+
+        mlen = RadioSetting(
+            "msg_max_len", "Max message length",
+            RadioSettingValueInteger(0, 144, cfg.max_len))
+        mlen.set_doc("Maximum characters when composing a message on the radio "
+                     "(1-144; 0 = default 144). Lower it to cap outgoing messages.")
+        group.append(mlen)
+
+        for i in range(MSGC_NUM_PRESETS):
+            ps = RadioSetting(
+                "msg_preset_%d" % i, "Quick text %d" % (i + 1),
+                RadioSettingValueString(0, MSGC_PRESET_LEN, cfg.presets[i],
+                                        autopad=False, charset=MSG_PRESET_CHARSET))
+            ps.set_doc("Preset message %d (up to %d chars), selectable on the "
+                       "radio when composing." % (i + 1, MSGC_PRESET_LEN))
+            group.append(ps)
+        return group
+
     def get_settings(self):
         radio = self._get_radio_settings()
         rwsettings = self._get_radiowide_settings()
@@ -2116,6 +2261,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         contacts = self._get_contacts_settings()
         rxgroups = self._get_rxgroup_settings()
         dtmf = self._get_dtmf_settings()
+        messages = self._get_messages_settings()
         store = self._read_aes_store()
         aes = RadioSettingGroup("aes", "AES Keys")
 
@@ -2156,7 +2302,7 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
                        "exactly as shown in TYT CPS." % k)
             aes.append(kv)
         return RadioSettings(radio, rwsettings, quickkeys, contacts, rxgroups,
-                             dtmf, aes)
+                             dtmf, messages, aes)
 
     def set_settings(self, settings):
         flat = {}
@@ -2360,6 +2506,31 @@ class OpenGD77AESRadio(chirp_common.CloneModeRadio):
         region = region_with_aes(
             bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE]), store.to_payload())
         img[IMG_AES:IMG_AES + SECTOR_SIZE] = region
+
+        # -- messages config (MSGC) -- the Messages group is always present in
+        # get_settings(), so build the config from its (possibly default) values
+        # and write only when there's something to store, or a block already
+        # exists (don't litter the custom-data chain for non-messaging users).
+        if any(k.startswith("msg_") and k != "msg_note" for k in flat):
+            region_bytes = bytes(img[IMG_AES:IMG_AES + SECTOR_SIZE])
+            existing_off, existing = find_block(region_bytes,
+                                                CUSTOM_TYPE_MSG_CONFIG)
+            cfg = MsgConfig.from_payload(existing)
+            if "msg_default_dst" in flat:
+                cfg.default_dst = int(flat["msg_default_dst"].value) & 0xFFFFFF
+            if "msg_default_group" in flat:
+                cfg.default_group = (str(flat["msg_default_group"].value) == "Group")
+            if "msg_max_len" in flat:
+                cfg.max_len = int(flat["msg_max_len"].value) & 0xFF
+            for i in range(MSGC_NUM_PRESETS):
+                mk = "msg_preset_%d" % i
+                if mk in flat:
+                    cfg.presets[i] = str(flat[mk].value)[:MSGC_PRESET_LEN]
+            nonempty = ((cfg.default_dst != 0) or any(p for p in cfg.presets)
+                        or (cfg.max_len != 0))
+            if existing_off is not None or nonempty:
+                img[IMG_AES:IMG_AES + SECTOR_SIZE] = region_with_block(
+                    region_bytes, CUSTOM_TYPE_MSG_CONFIG, cfg.to_payload())
 
         self._mmap = memmap.MemoryMapBytes(bytes(img))
         self._build_caches()      # contact/RX-group edits affect channel dropdowns
